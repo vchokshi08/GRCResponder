@@ -1,0 +1,18 @@
+﻿{
+    "contentVersion":  "1.0.0.0",
+    "$schema":  "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "parameters":  {
+                       "environment":  {
+                                           "value":  "dev"
+                                       },
+                       "projectName":  {
+                                           "value":  "grcresponder"
+                                       },
+                       "location":  {
+                                        "value":  "West US 2"
+                                    },
+                       "geminiApiKey":  {
+                                            "value":  "AIzaSyBTqUsU_uCRoPEWObejTC9W9vnjlJV0GEk"
+                                        }
+                   }
+}
