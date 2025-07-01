@@ -1,1210 +1,704 @@
 import azure.functions as func
-import azure.durable_functions as df
 import logging
 import json
 import os
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-import asyncio
-import aiohttp
-import requests
-from bs4 import BeautifulSoup
-import hashlib
+from urllib.request import urlopen, Request
+from urllib.parse import urljoin, urlparse
+from urllib.error import HTTPError, URLError
+import ssl
 import re
-from urllib.parse import urljoin, urlparse, quote
-import PyPDF2
-import io
 import time
-from azure.storage.blob import BlobServiceClient, BlobClient
+from typing import List, Dict, Any, Optional
+from io import BytesIO
+
+# Azure SDK imports (confirmed working)
+from azure.storage.blob import BlobServiceClient
 from azure.keyvault.secrets import SecretClient
 from azure.identity import DefaultAzureCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.models import VectorizedQuery
-from azure.core.credentials import AzureKeyCredential
-import google.generativeai as genai
-import numpy as np
-from dataclasses import dataclass, asdict
-import uuid
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
+from azure.search.documents.indexes.models import SearchIndex, SearchField, SearchFieldDataType, SimpleField, SearchableField, VectorSearch, VectorSearchProfile, VectorSearchAlgorithmConfiguration, HnswAlgorithmConfiguration
 
-# Initialize Function App
+# Other working imports
+from bs4 import BeautifulSoup
+import PyPDF2
+import google.generativeai as genai
+from dateutil.parser import parse as date_parse
+import numpy as np
+
+# Create function app
 app = func.FunctionApp()
 
-# Configuration
-STORAGE_CONNECTION_STRING = os.environ.get('AzureWebJobsStorage')
-KEY_VAULT_URL = os.environ.get('KEY_VAULT_URL', 'https://grcresponder-dev-kv.vault.azure.net/')
-SEARCH_SERVICE_ENDPOINT = os.environ.get('SEARCH_SERVICE_ENDPOINT', 'https://grcresponder-dev-search.search.windows.net')
-SEARCH_API_KEY = os.environ.get('SEARCH_API_KEY')
-GEMINI_MODEL_NAME = 'gemini-2.0-flash-exp'
+# Global configuration
+STORAGE_ACCOUNT_NAME = "grcresponderdevstorage"
+KEY_VAULT_NAME = "grcresponder-dev-kv"
+SEARCH_SERVICE_NAME = "grcresponder-dev-search"
+SEARCH_INDEX_NAME = "cpuc-documents"
 
-# Global Constants - Based on Original GRCResponder Patterns
-CPUC_BASE_URL = "https://apps.cpuc.ca.gov"
-PROCEEDINGS_ENDPOINTS = [
-    "/apex/f?p=401:1:0",    # General proceedings
-    "/apex/f?p=401:56:0",   # Energy proceedings  
-    "/apex/f?p=401:57:0"    # Rulemaking proceedings
-]
+# Global clients - initialized on first use
+_azure_clients = None
+_gemini_model = None
 
-# Rate limiting configuration (from original code patterns)
-REQUEST_DELAY = 2.0  # seconds between requests to avoid CPUC blocking
-MAX_CONCURRENT_DOWNLOADS = 5
-CHUNK_SIZE = 1000  # characters for text chunking
-CHUNK_OVERLAP = 200
-
-# Data Models - Mirror original structure
-@dataclass
-class CPUCProceeding:
-    proceeding_id: str
-    title: str
-    url: str
-    status: str
-    date_filed: str
-    last_updated: str
-    category: str
-    summary: str = ""
-    documents: List[Dict] = None
+def get_azure_clients():
+    """Get Azure clients with caching"""
+    global _azure_clients
+    if _azure_clients is None:
+        try:
+            credential = DefaultAzureCredential()
+            
+            kv_client = SecretClient(
+                vault_url=f"https://{KEY_VAULT_NAME}.vault.azure.net/",
+                credential=credential
+            )
+            
+            storage_client = BlobServiceClient(
+                account_url=f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net",
+                credential=credential
+            )
+            
+            search_endpoint = f"https://{SEARCH_SERVICE_NAME}.search.windows.net"
+            search_client = SearchClient(
+                endpoint=search_endpoint,
+                index_name=SEARCH_INDEX_NAME,
+                credential=credential
+            )
+            
+            search_index_client = SearchIndexClient(
+                endpoint=search_endpoint,
+                credential=credential
+            )
+            
+            _azure_clients = (kv_client, storage_client, search_client, search_index_client)
+            logging.info("Azure clients initialized successfully")
+            
+        except Exception as e:
+            logging.error(f"Failed to initialize Azure clients: {str(e)}")
+            _azure_clients = (None, None, None, None)
     
-    def __post_init__(self):
-        if self.documents is None:
-            self.documents = []
+    return _azure_clients
 
-@dataclass
-class ProcessedDocument:
-    document_id: str
-    proceeding_id: str
-    filename: str
-    blob_url: str
-    text_content: str
-    file_size: int
-    processed_timestamp: str
-    metadata: Dict
-    chunks: List[str] = None
+def get_gemini_model():
+    """Get Gemini model with caching"""
+    global _gemini_model
+    if _gemini_model is None:
+        try:
+            kv_client, _, _, _ = get_azure_clients()
+            if kv_client:
+                gemini_key = kv_client.get_secret("gemini-api-key").value
+                genai.configure(api_key=gemini_key)
+                _gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                logging.info("Gemini model initialized successfully")
+            else:
+                logging.error("Cannot initialize Gemini - Key Vault client not available")
+        except Exception as e:
+            logging.error(f"Failed to initialize Gemini model: {str(e)}")
+            _gemini_model = None
     
-    def __post_init__(self):
-        if self.chunks is None:
-            self.chunks = []
+    return _gemini_model
 
-# Utility Classes
-class AzureServiceManager:
-    """Azure services initialization and management"""
+def safe_urlopen(url: str, headers: Dict[str, str] = None, timeout: int = 30) -> str:
+    """Safely open URL using urllib"""
+    try:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        default_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        if headers:
+            default_headers.update(headers)
+        
+        req = Request(url)
+        for key, value in default_headers.items():
+            req.add_header(key, value)
+        
+        with urlopen(req, timeout=timeout, context=ssl_context) as response:
+            return response.read().decode('utf-8')
+            
+    except Exception as e:
+        logging.error(f"Error opening URL {url}: {str(e)}")
+        raise
+
+def download_pdf(url: str) -> bytes:
+    """Download PDF using urllib"""
+    try:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        req = Request(url)
+        req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        
+        with urlopen(req, timeout=60, context=ssl_context) as response:
+            return response.read()
+    except Exception as e:
+        logging.error(f"Failed to download PDF from {url}: {str(e)}")
+        raise
+
+class CPUCProceedingScraper:
+    """CPUC Proceeding Scraper"""
+    
     def __init__(self):
-        self.credential = DefaultAzureCredential()
-        self.blob_client = None
-        self.search_client = None
-        self.gemini_client = None
-        self._initialized = False
+        self.base_url = "https://apps.cpuc.ca.gov"
+        self.search_url = f"{self.base_url}/apex/f?p=401:56"
         
-    async def initialize(self):
-        """Initialize all Azure services and Gemini client"""
-        if self._initialized:
-            return
-            
+    def scrape_recent_proceedings(self, days_back: int = 30) -> List[Dict[str, Any]]:
+        """Scrape recent CPUC proceedings"""
         try:
-            # Initialize Key Vault and get Gemini API key
-            kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=self.credential)
-            gemini_api_key = kv_client.get_secret("gemini-api-key").value
+            logging.info(f"Scraping CPUC proceedings from last {days_back} days")
             
-            # Configure Gemini Flash 2.0 - following original patterns
-            genai.configure(api_key=gemini_api_key)
-            self.gemini_client = genai.GenerativeModel(
-                model_name=GEMINI_MODEL_NAME,
-                generation_config={
-                    "temperature": 0.1,
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "max_output_tokens": 8192,
-                }
-            )
+            html_content = safe_urlopen(self.search_url)
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Initialize Azure Blob Storage
-            self.blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+            proceedings = []
             
-            # Initialize Azure AI Search
-            self.search_client = SearchClient(
-                endpoint=SEARCH_SERVICE_ENDPOINT,
-                index_name="grc-documents",
-                credential=AzureKeyCredential(SEARCH_API_KEY)
-            )
+            for link in soup.find_all('a', href=True):
+                href = link.get('href')
+                if href and ('proceeding' in href.lower() or 'p=401:' in href):
+                    proceeding_url = urljoin(self.base_url, href)
+                    proceeding_data = self._extract_proceeding_info(link, proceeding_url)
+                    if proceeding_data:
+                        proceedings.append(proceeding_data)
             
-            self._initialized = True
-            logging.info("Azure services initialized successfully")
+            logging.info(f"Found {len(proceedings)} proceedings")
+            return proceedings[:20]
             
         except Exception as e:
-            logging.error(f"Failed to initialize Azure services: {str(e)}")
-            raise
-
-class CPUCScraperService:
-    """CPUC proceeding scraper - based on original grc_tools logic"""
+            logging.error(f"Failed to scrape CPUC proceedings: {str(e)}")
+            return []
     
-    def __init__(self, service_manager: AzureServiceManager):
-        self.service_manager = service_manager
-        self.session = None
-        
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30),
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    def _extract_proceeding_info(self, link_element, url: str) -> Optional[Dict[str, Any]]:
+        """Extract proceeding information"""
+        try:
+            text = link_element.get_text(strip=True)
+            if not text or len(text) < 5:
+                return None
+                
+            proceeding_match = re.search(r'[A-Z]\.\d{2}-\d{2}-\d{3}', text)
+            proceeding_number = proceeding_match.group(0) if proceeding_match else None
+            
+            return {
+                'proceeding_number': proceeding_number,
+                'title': text,
+                'url': url,
+                'scraped_date': datetime.utcnow().isoformat(),
+                'type': 'proceeding'
             }
-        )
-        return self
-        
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+        except Exception:
+            return None
+
+class DocumentDownloader:
+    """Document Downloader"""
     
-    async def scrape_all_proceedings(self) -> List[CPUCProceeding]:
-        """Main scraper method - replicates original proceeding discovery logic"""
-        all_proceedings = []
+    def __init__(self):
+        _, self.storage_client, _, _ = get_azure_clients()
+        self.container_name = "documents"
         
-        for endpoint in PROCEEDINGS_ENDPOINTS:
-            try:
-                category = self._extract_category_from_endpoint(endpoint)
-                logging.info(f"Scraping {category} proceedings from {endpoint}")
-                
-                proceedings = await self._scrape_proceedings_page(endpoint, category)
-                all_proceedings.extend(proceedings)
-                
-                # Rate limiting between endpoint requests
-                await asyncio.sleep(REQUEST_DELAY)
-                
-            except Exception as e:
-                logging.error(f"Failed to scrape endpoint {endpoint}: {str(e)}")
-                continue
-        
-        logging.info(f"Total proceedings discovered: {len(all_proceedings)}")
-        return all_proceedings
-    
-    def _extract_category_from_endpoint(self, endpoint: str) -> str:
-        """Extract proceeding category from CPUC endpoint"""
-        if "f?p=401:56" in endpoint:
-            return "Energy"
-        elif "f?p=401:57" in endpoint:
-            return "Rulemaking"
-        else:
-            return "General"
-    
-    async def _scrape_proceedings_page(self, endpoint: str, category: str) -> List[CPUCProceeding]:
-        """Scrape proceedings from a specific CPUC page"""
-        proceedings = []
-        url = CPUC_BASE_URL + endpoint
-        
+    def download_proceeding_documents(self, proceeding: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Download documents for a proceeding"""
         try:
-            async with self.session.get(url) as response:
-                if response.status != 200:
-                    logging.warning(f"HTTP {response.status} for {url}")
-                    return proceedings
+            if not self.storage_client:
+                logging.error("Storage client not available")
+                return []
                 
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                # Parse proceeding entries - adapted from original selectors
-                proceeding_elements = self._find_proceeding_elements(soup)
-                
-                for element in proceeding_elements:
-                    try:
-                        proceeding = self._parse_proceeding_element(element, category)
-                        if proceeding:
-                            proceedings.append(proceeding)
-                    except Exception as e:
-                        logging.warning(f"Failed to parse proceeding element: {str(e)}")
-                        continue
-                
+            logging.info(f"Downloading documents for: {proceeding.get('proceeding_number')}")
+            
+            proceeding_url = proceeding['url']
+            html_content = safe_urlopen(proceeding_url)
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            documents = []
+            
+            for link in soup.find_all('a', href=True):
+                href = link.get('href')
+                if href and href.lower().endswith('.pdf'):
+                    doc_url = urljoin(proceeding_url, href)
+                    doc_info = self._download_single_document(doc_url, proceeding, link.get_text(strip=True))
+                    if doc_info:
+                        documents.append(doc_info)
+                        if len(documents) >= 5:
+                            break
+            
+            logging.info(f"Downloaded {len(documents)} documents")
+            return documents
+            
         except Exception as e:
-            logging.error(f"Failed to scrape proceedings page {url}: {str(e)}")
-        
-        return proceedings
+            logging.error(f"Failed to download documents: {str(e)}")
+            return []
     
-    def _find_proceeding_elements(self, soup: BeautifulSoup) -> List:
-        """Find proceeding elements - based on original CPUC HTML structure patterns"""
-        # Try multiple selectors based on CPUC's changing HTML structure
-        selectors = [
-            'tr.highlight-row',
-            'tr[class*="proceeding"]',
-            'tr td:first-child a[href*="proceeding"]',
-            '.proceeding-item',
-            'table tr:has(td a[href*="A."])',  # Application numbers
-            'table tr:has(td a[href*="R."])',  # Rulemaking numbers
-        ]
-        
-        elements = []
-        for selector in selectors:
-            try:
-                found = soup.select(selector)
-                if found:
-                    elements.extend(found)
-                    break
-            except Exception:
-                continue
-        
-        # Fallback: find table rows with proceeding-like patterns
-        if not elements:
-            tables = soup.find_all('table')
-            for table in tables:
-                rows = table.find_all('tr')
-                for row in rows:
-                    if self._is_proceeding_row(row):
-                        elements.append(row)
-        
-        return elements
-    
-    def _is_proceeding_row(self, row) -> bool:
-        """Check if table row contains proceeding data"""
-        text = row.get_text().strip()
-        # Look for proceeding ID patterns (A.XX-XX-XXX or R.XX-XX-XXX)
-        proceeding_pattern = r'[AR]\.\d{2}-\d{2}-\d{3}'
-        return bool(re.search(proceeding_pattern, text))
-    
-    def _parse_proceeding_element(self, element, category: str) -> Optional[CPUCProceeding]:
-        """Parse individual proceeding element - based on original patterns"""
+    def _download_single_document(self, url: str, proceeding: Dict, title: str) -> Optional[Dict[str, Any]]:
+        """Download and process single PDF"""
         try:
-            # Extract proceeding ID
-            proceeding_id = self._extract_proceeding_id(element)
-            if not proceeding_id:
-                return None
+            proceeding_num = proceeding.get('proceeding_number', 'unknown')
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            blob_name = f"{proceeding_num}/{timestamp}_{title[:30]}.pdf"
+            blob_name = re.sub(r'[^\w\-_./]', '_', blob_name)
             
-            # Extract title and URL
-            title_link = element.find('a', href=True)
-            if not title_link:
-                return None
+            pdf_content = download_pdf(url)
+            text_content = self._extract_pdf_text(pdf_content)
             
-            title = title_link.get_text().strip()
-            proceeding_url = urljoin(CPUC_BASE_URL, title_link['href'])
-            
-            # Extract status and dates
-            cells = element.find_all('td')
-            status = self._extract_text_from_cells(cells, 'status', 'Active')
-            date_filed = self._extract_text_from_cells(cells, 'date', '')
-            
-            proceeding = CPUCProceeding(
-                proceeding_id=proceeding_id,
-                title=title,
-                url=proceeding_url,
-                status=status,
-                date_filed=date_filed,
-                last_updated=datetime.now().isoformat(),
-                category=category,
-                summary=title[:200] + "..." if len(title) > 200 else title
+            blob_client = self.storage_client.get_blob_client(
+                container=self.container_name, 
+                blob=blob_name
             )
+            blob_client.upload_blob(pdf_content, overwrite=True)
             
-            return proceeding
+            return {
+                'title': title,
+                'url': url,
+                'blob_name': blob_name,
+                'text_content': text_content,
+                'proceeding_number': proceeding_num,
+                'file_size': len(pdf_content),
+                'download_date': datetime.utcnow().isoformat(),
+                'type': 'document'
+            }
             
         except Exception as e:
-            logging.warning(f"Failed to parse proceeding element: {str(e)}")
+            logging.error(f"Failed to download document from {url}: {str(e)}")
             return None
     
-    def _extract_proceeding_id(self, element) -> Optional[str]:
-        """Extract proceeding ID from element"""
-        text = element.get_text()
-        # Look for standard CPUC proceeding ID patterns
-        patterns = [
-            r'[AR]\.\d{2}-\d{2}-\d{3}',
-            r'[AR]\d{4}\d{2}\d{3}',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(0)
-        return None
-    
-    def _extract_text_from_cells(self, cells: List, field_type: str, default: str) -> str:
-        """Extract specific field from table cells"""
-        if len(cells) < 2:
-            return default
-        
-        # Heuristic based on cell position and content
-        for i, cell in enumerate(cells):
-            cell_text = cell.get_text().strip()
+    def _extract_pdf_text(self, pdf_content: bytes) -> str:
+        """Extract text from PDF"""
+        try:
+            pdf_file = BytesIO(pdf_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
             
-            if field_type == 'status' and i > 1:
-                if any(status in cell_text.lower() for status in ['active', 'closed', 'pending']):
-                    return cell_text
-            elif field_type == 'date' and i > 0:
-                # Look for date patterns
-                if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', cell_text):
-                    return cell_text
-        
-        return default
+            text_content = ""
+            for page in pdf_reader.pages:
+                text_content += page.extract_text() + "\n"
+            
+            return text_content.strip()
+            
+        except Exception as e:
+            logging.error(f"Failed to extract PDF text: {str(e)}")
+            return ""
 
-# Global service manager instance
-service_manager = AzureServiceManager()
-
-# Azure Function 1: Proceeding Scraper
-@app.function_name("ProceedingScraper")
-@app.schedule(schedule="0 0 6 * * *", arg_name="timer", run_on_startup=False)
-async def proceeding_scraper(timer: func.TimerRequest) -> None:
-    """
-    CPUC Proceeding Scraper - Part 1 of 3-step pipeline
-    Runs daily at 6 AM to discover new and updated proceedings
-    """
-    logging.info("Starting CPUC Proceeding Scraper - Step 1/3")
+class VectorDatabaseBuilder:
+    """Vector Database Builder"""
     
-    try:
-        await service_manager.initialize()
+    def __init__(self):
+        _, _, self.search_client, self.search_index_client = get_azure_clients()
         
-        # Scrape all proceedings using original patterns
-        async with CPUCScraperService(service_manager) as scraper:
-            proceedings = await scraper.scrape_all_proceedings()
-        
-        if not proceedings:
-            logging.warning("No proceedings found during scraping")
-            return
-        
-        # Store proceedings metadata in blob storage
-        await store_proceedings_metadata(proceedings)
-        
-        # Create download queue for Document Downloader
-        await create_download_queue(proceedings)
-        
-        logging.info(f"Proceeding scraper completed successfully. Found {len(proceedings)} proceedings")
-        
-    except Exception as e:
-        logging.error(f"Proceeding scraper failed: {str(e)}")
-        raise
-
-async def store_proceedings_metadata(proceedings: List[CPUCProceeding]) -> None:
-    """Store proceedings metadata in Azure Blob Storage"""
-    try:
-        container_name = "proceedings-metadata"
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        blob_name = f"proceedings_{timestamp}.json"
-        
-        # Convert proceedings to JSON
-        proceedings_data = [asdict(p) for p in proceedings]
-        json_data = json.dumps(proceedings_data, indent=2, default=str)
-        
-        # Upload to blob storage
-        blob_client = service_manager.blob_client.get_blob_client(
-            container=container_name,
-            blob=blob_name
-        )
-        
-        await blob_client.upload_blob(json_data, overwrite=True)
-        logging.info(f"Stored proceedings metadata: {blob_name}")
-        
-    except Exception as e:
-        logging.error(f"Failed to store proceedings metadata: {str(e)}")
-        raise
-
-async def create_download_queue(proceedings: List[CPUCProceeding]) -> None:
-    """Create download queue for Document Downloader"""
-    try:
-        container_name = "processing-queue"
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        blob_name = f"download_queue_{timestamp}.json"
-        
-        # Create queue items
-        queue_data = []
-        for proceeding in proceedings:
-            queue_item = {
-                "proceeding_id": proceeding.proceeding_id,
-                "proceeding_url": proceeding.url,
-                "title": proceeding.title,
-                "category": proceeding.category,
-                "status": proceeding.status,
-                "queued_at": datetime.now().isoformat(),
-                "retry_count": 0
-            }
-            queue_data.append(queue_item)
-        
-        # Store queue
-        blob_client = service_manager.blob_client.get_blob_client(
-            container=container_name,
-            blob=blob_name
-        )
-        
-        await blob_client.upload_blob(json.dumps(queue_data, indent=2), overwrite=True)
-        logging.info(f"Created download queue with {len(queue_data)} items: {blob_name}")
-        
-    except Exception as e:
-        logging.error(f"Failed to create download queue: {str(e)}")
-        raise
-
-# Azure Function 2: Document Downloader
-@app.function_name("DocumentDownloader")
-@app.schedule(schedule="0 0 */2 * * *", arg_name="timer", run_on_startup=False)
-async def document_downloader(timer: func.TimerRequest) -> None:
-    """
-    Document Downloader - Part 2 of 3-step pipeline
-    Runs every 2 hours to download and process documents
-    """
-    logging.info("Starting Document Downloader - Step 2/3")
-    
-    try:
-        await service_manager.initialize()
-        
-        # Get queued proceedings for download
-        queue_items = await get_download_queue()
-        
-        if not queue_items:
-            logging.info("No items in download queue")
-            return
-        
-        # Process downloads with concurrency control (original pattern)
-        processed_documents = await process_download_queue(queue_items)
-        
-        if processed_documents:
-            # Create vector processing queue
-            await create_vector_queue(processed_documents)
-        
-        logging.info(f"Document downloader completed. Processed {len(processed_documents)} documents")
-        
-    except Exception as e:
-        logging.error(f"Document downloader failed: {str(e)}")
-        raise
-
-async def get_download_queue() -> List[Dict]:
-    """Get items from download queue"""
-    try:
-        container_name = "processing-queue"
-        container_client = service_manager.blob_client.get_container_client(container_name)
-        queue_items = []
-        
-        # Process all download queue files
-        async for blob in container_client.list_blobs():
-            if blob.name.startswith("download_queue_"):
-                blob_client = service_manager.blob_client.get_blob_client(
-                    container=container_name,
-                    blob=blob.name
+    def create_search_index(self):
+        """Create search index"""
+        try:
+            if not self.search_index_client:
+                logging.error("Search index client not available")
+                return
+                
+            fields = [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="title", type=SearchFieldDataType.String),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SimpleField(name="proceeding_number", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="document_type", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="url", type=SearchFieldDataType.String),
+                SimpleField(name="created_date", type=SearchFieldDataType.DateTimeOffset, filterable=True),
+                SearchField(
+                    name="content_vector",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                    vector_search_dimensions=768,
+                    vector_search_profile_name="myHnswProfile"
                 )
-                
-                download_stream = await blob_client.download_blob()
-                queue_data = json.loads(await download_stream.readall())
-                queue_items.extend(queue_data)
-                
-                # Delete processed queue file
-                await blob_client.delete_blob()
-        
-        return queue_items
-        
-    except Exception as e:
-        logging.error(f"Failed to get download queue: {str(e)}")
-        return []
-
-async def process_download_queue(queue_items: List[Dict]) -> List[ProcessedDocument]:
-    """Process download queue with original concurrency patterns"""
-    processed_documents = []
-    
-    # Process in batches to avoid overwhelming CPUC servers
-    batch_size = MAX_CONCURRENT_DOWNLOADS
-    
-    for i in range(0, len(queue_items), batch_size):
-        batch = queue_items[i:i+batch_size]
-        
-        # Process batch concurrently
-        tasks = [process_single_proceeding(item) for item in batch]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in batch_results:
-            if isinstance(result, Exception):
-                logging.error(f"Batch processing error: {str(result)}")
-                continue
-            if result:
-                processed_documents.extend(result)
-        
-        # Rate limiting between batches
-        if i + batch_size < len(queue_items):
-            await asyncio.sleep(REQUEST_DELAY * batch_size)
-    
-    return processed_documents
-
-async def process_single_proceeding(queue_item: Dict) -> List[ProcessedDocument]:
-    """Process documents from a single proceeding"""
-    documents = []
-    
-    try:
-        proceeding_url = queue_item["proceeding_url"]
-        proceeding_id = queue_item["proceeding_id"]
-        
-        # Download proceeding page and find document links
-        async with aiohttp.ClientSession() as session:
-            document_urls = await discover_proceeding_documents(session, proceeding_url)
-            
-            # Download each document
-            for doc_url, doc_filename in document_urls:
-                try:
-                    # Rate limiting between document downloads
-                    await asyncio.sleep(REQUEST_DELAY)
-                    
-                    # Download PDF content
-                    pdf_content = await download_pdf_document(session, doc_url)
-                    if not pdf_content:
-                        continue
-                    
-                    # Extract text content
-                    text_content = extract_text_from_pdf(pdf_content)
-                    if not text_content or len(text_content.strip()) < 100:
-                        continue
-                    
-                    # Store PDF in blob storage
-                    blob_url = await store_document_blob(pdf_content, proceeding_id, doc_filename)
-                    
-                    # Create processed document
-                    document = ProcessedDocument(
-                        document_id=str(uuid.uuid4()),
-                        proceeding_id=proceeding_id,
-                        filename=doc_filename,
-                        blob_url=blob_url,
-                        text_content=text_content,
-                        file_size=len(pdf_content),
-                        processed_timestamp=datetime.now().isoformat(),
-                        metadata={
-                            "source_url": doc_url,
-                            "proceeding_title": queue_item.get("title", ""),
-                            "category": queue_item.get("category", ""),
-                            "text_length": len(text_content),
-                            "status": queue_item.get("status", "")
-                        }
-                    )
-                    
-                    documents.append(document)
-                    
-                except Exception as e:
-                    logging.warning(f"Failed to process document {doc_url}: {str(e)}")
-                    continue
-        
-    except Exception as e:
-        logging.error(f"Failed to process proceeding {queue_item.get('proceeding_id')}: {str(e)}")
-    
-    return documents
-
-async def discover_proceeding_documents(session: aiohttp.ClientSession, proceeding_url: str) -> List[tuple]:
-    """Discover document links from proceeding page"""
-    document_urls = []
-    
-    try:
-        async with session.get(proceeding_url) as response:
-            if response.status != 200:
-                return document_urls
-            
-            html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Find PDF document links - based on original patterns
-            pdf_patterns = [
-                'a[href$=".pdf"]',
-                'a[href*=".pdf"]',
-                'a[href*="document"]',
-                'a[href*="filing"]'
             ]
             
-            for pattern in pdf_patterns:
-                links = soup.select(pattern)
-                for link in links:
-                    href = link.get('href')
-                    if href and href.lower().endswith('.pdf'):
-                        full_url = urljoin(proceeding_url, href)
-                        filename = link.get_text().strip() or href.split('/')[-1]
-                        document_urls.append((full_url, filename))
-        
-    except Exception as e:
-        logging.warning(f"Failed to discover documents from {proceeding_url}: {str(e)}")
+            vector_search = VectorSearch(
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw"
+                    )
+                ],
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ]
+            )
+            
+            index = SearchIndex(
+                name=SEARCH_INDEX_NAME,
+                fields=fields,
+                vector_search=vector_search
+            )
+            
+            self.search_index_client.create_or_update_index(index)
+            logging.info(f"Created/updated search index: {SEARCH_INDEX_NAME}")
+            
+        except Exception as e:
+            logging.error(f"Failed to create search index: {str(e)}")
     
-    return document_urls
-
-async def download_pdf_document(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
-    """Download PDF document content"""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
-            if response.status == 200 and response.content_type == 'application/pdf':
-                content = await response.read()
-                if len(content) > 1000:  # Minimum size check
-                    return content
-    except Exception as e:
-        logging.warning(f"Failed to download PDF from {url}: {str(e)}")
-    
-    return None
-
-def extract_text_from_pdf(pdf_content: bytes) -> str:
-    """Extract text from PDF - based on original extraction logic"""
-    try:
-        pdf_file = io.BytesIO(pdf_content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        
-        text_content = ""
-        for page_num, page in enumerate(pdf_reader.pages):
-            try:
-                page_text = page.extract_text()
-                if page_text:
-                    text_content += f"\n--- Page {page_num + 1} ---\n"
-                    text_content += page_text + "\n"
-            except Exception as e:
-                logging.warning(f"Failed to extract text from page {page_num}: {str(e)}")
-                continue
-        
-        # Clean and normalize text
-        text_content = re.sub(r'\s+', ' ', text_content)
-        text_content = text_content.strip()
-        
-        return text_content
-        
-    except Exception as e:
-        logging.error(f"Failed to extract text from PDF: {str(e)}")
-        return ""
-
-async def store_document_blob(pdf_content: bytes, proceeding_id: str, filename: str) -> str:
-    """Store PDF document in Azure Blob Storage"""
-    try:
-        container_name = "documents"
-        # Clean filename for blob storage
-        clean_filename = re.sub(r'[^\w\-_\.]', '_', filename)
-        blob_name = f"{proceeding_id}/{clean_filename}"
-        
-        blob_client = service_manager.blob_client.get_blob_client(
-            container=container_name,
-            blob=blob_name
-        )
-        
-        await blob_client.upload_blob(pdf_content, overwrite=True, content_type='application/pdf')
-        return blob_client.url
-        
-    except Exception as e:
-        logging.error(f"Failed to store document blob: {str(e)}")
-        raise
-
-async def create_vector_queue(documents: List[ProcessedDocument]) -> None:
-    """Create queue for vector processing"""
-    try:
-        container_name = "processing-queue"
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        blob_name = f"vector_queue_{timestamp}.json"
-        
-        # Prepare queue data
-        queue_data = []
-        for doc in documents:
-            queue_item = {
-                "document_id": doc.document_id,
-                "proceeding_id": doc.proceeding_id,
-                "filename": doc.filename,
-                "blob_url": doc.blob_url,
-                "text_content": doc.text_content,
-                "file_size": doc.file_size,
-                "metadata": doc.metadata,
-                "queued_at": datetime.now().isoformat()
-            }
-            queue_data.append(queue_item)
-        
-        # Store queue
-        blob_client = service_manager.blob_client.get_blob_client(
-            container=container_name,
-            blob=blob_name
-        )
-        
-        await blob_client.upload_blob(json.dumps(queue_data, indent=2), overwrite=True)
-        logging.info(f"Created vector queue with {len(documents)} items: {blob_name}")
-        
-    except Exception as e:
-        logging.error(f"Failed to create vector queue: {str(e)}")
-        raise
-
-# Azure Function 3: Vector Database Builder
-@app.function_name("VectorDatabaseBuilder")
-@app.schedule(schedule="0 0 */4 * * *", arg_name="timer", run_on_startup=False)
-async def vector_database_builder(timer: func.TimerRequest) -> None:
-    """
-    Vector Database Builder - Part 3 of 3-step pipeline
-    Runs every 4 hours to build vector embeddings using Gemini Flash 2.0
-    """
-    logging.info("Starting Vector Database Builder - Step 3/3")
-    
-    try:
-        await service_manager.initialize()
-        
-        # Get queued documents for vector processing
-        queue_items = await get_vector_queue()
-        
-        if not queue_items:
-            logging.info("No items in vector processing queue")
-            return
-        
-        # Process documents with multithreading (original pattern)
-        await process_vector_queue_multithreaded(queue_items)
-        
-        logging.info(f"Vector database builder completed. Processed {len(queue_items)} documents")
-        
-    except Exception as e:
-        logging.error(f"Vector database builder failed: {str(e)}")
-        raise
-
-async def get_vector_queue() -> List[Dict]:
-    """Get items from vector processing queue"""
-    try:
-        container_name = "processing-queue"
-        container_client = service_manager.blob_client.get_container_client(container_name)
-        queue_items = []
-        
-        # Process all vector queue files
-        async for blob in container_client.list_blobs():
-            if blob.name.startswith("vector_queue_"):
-                blob_client = service_manager.blob_client.get_blob_client(
-                    container=container_name,
-                    blob=blob.name
-                )
-                
-                download_stream = await blob_client.download_blob()
-                queue_data = json.loads(await download_stream.readall())
-                queue_items.extend(queue_data)
-                
-                # Delete processed queue file
-                await blob_client.delete_blob()
-        
-        return queue_items
-        
-    except Exception as e:
-        logging.error(f"Failed to get vector queue: {str(e)}")
-        return []
-
-async def process_vector_queue_multithreaded(queue_items: List[Dict]) -> None:
-    """Process vector queue with multithreading - based on original multithreaded_insert.py patterns"""
-    
-    # Process in batches for better memory management
-    batch_size = 10
-    
-    for i in range(0, len(queue_items), batch_size):
-        batch = queue_items[i:i+batch_size]
-        
-        # Process each document in the batch
-        search_documents = []
-        for doc_data in batch:
-            try:
-                # Create text chunks - based on original chunking strategy
-                chunks = create_text_chunks(doc_data["text_content"])
-                
-                # Generate embeddings for each chunk using Gemini Flash 2.0
-                for i, chunk in enumerate(chunks):
-                    chunk_embeddings = await generate_embeddings_with_retry(chunk)
-                    
-                    if chunk_embeddings:
-                        search_doc = {
-                            "id": f"{doc_data['document_id']}_chunk_{i}",
-                            "document_id": doc_data["document_id"],
-                            "proceeding_id": doc_data["proceeding_id"],
-                            "filename": doc_data["filename"],
-                            "blob_url": doc_data["blob_url"],
-                            "content": chunk,
-                            "content_vector": chunk_embeddings,
-                            "metadata": json.dumps(doc_data["metadata"]),
-                            "file_size": doc_data["file_size"],
-                            "chunk_index": i,
-                            "total_chunks": len(chunks),
-                            "processed_at": datetime.now().isoformat()
-                        }
-                        search_documents.append(search_doc)
-                
-            except Exception as e:
-                logging.error(f"Failed to process document {doc_data.get('document_id')}: {str(e)}")
-                continue
-        
-        # Index batch of documents in Azure AI Search
-        if search_documents:
-            await index_documents_batch(search_documents)
-
-def create_text_chunks(text: str) -> List[str]:
-    """Create overlapping text chunks - based on original chunking logic"""
-    if not text or len(text.strip()) < 100:
-        return []
-    
-    chunks = []
-    words = text.split()
-    
-    # Calculate chunk size in words
-    chunk_size_words = CHUNK_SIZE // 5  # Approximate words per chunk
-    overlap_words = CHUNK_OVERLAP // 5
-    
-    for i in range(0, len(words), chunk_size_words - overlap_words):
-        chunk_words = words[i:i + chunk_size_words]
-        chunk_text = " ".join(chunk_words)
-        
-        if len(chunk_text.strip()) > 50:  # Minimum chunk size
-            chunks.append(chunk_text.strip())
-        
-        if i + chunk_size_words >= len(words):
-            break
-    
-    return chunks
-
-async def generate_embeddings_with_retry(text: str, max_retries: int = 3) -> List[float]:
-    """Generate embeddings with retry logic for robustness"""
-    for attempt in range(max_retries):
+    def generate_embeddings(self, text: str) -> List[float]:
+        """Generate embeddings using Gemini"""
         try:
-            # Use Gemini Flash 2.0 for embeddings
-            result = await service_manager.gemini_client.embed_content(
+            model = get_gemini_model()
+            if not model:
+                return []
+                
+            result = genai.embed_content(
                 model="models/text-embedding-004",
                 content=text,
-                task_type="retrieval_document",
-                title="CPUC Regulatory Document"
+                task_type="RETRIEVAL_DOCUMENT"
             )
-            
             return result['embedding']
+        except Exception as e:
+            logging.error(f"Failed to generate embeddings: {str(e)}")
+            return []
+    
+    def index_documents(self, documents: List[Dict[str, Any]]):
+        """Index documents"""
+        try:
+            if not self.search_client or not documents:
+                return
+                
+            logging.info(f"Indexing {len(documents)} documents")
+            
+            search_documents = []
+            for i, doc in enumerate(documents):
+                content = doc.get('text_content', '')[:8000]
+                embeddings = self.generate_embeddings(content)
+                
+                if embeddings:
+                    search_doc = {
+                        'id': f"{doc.get('proceeding_number', 'unknown')}_{i}",
+                        'title': doc.get('title', ''),
+                        'content': content,
+                        'proceeding_number': doc.get('proceeding_number', ''),
+                        'document_type': doc.get('type', 'document'),
+                        'url': doc.get('url', ''),
+                        'created_date': doc.get('download_date', datetime.utcnow().isoformat()),
+                        'content_vector': embeddings
+                    }
+                    search_documents.append(search_doc)
+            
+            if search_documents:
+                self.search_client.upload_documents(documents=search_documents)
+                logging.info(f"Successfully indexed {len(search_documents)} documents")
             
         except Exception as e:
-            logging.warning(f"Embedding generation attempt {attempt + 1} failed: {str(e)}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                logging.error(f"Failed to generate embeddings after {max_retries} attempts")
-                return []
+            logging.error(f"Failed to index documents: {str(e)}")
 
-async def index_documents_batch(documents: List[Dict]) -> None:
-    """Index batch of documents in Azure AI Search"""
-    try:
-        # Upload documents to search index
-        result = await service_manager.search_client.upload_documents(documents)
-        
-        successful_uploads = sum(1 for r in result if r.succeeded)
-        failed_uploads = len(result) - successful_uploads
-        
-        if failed_uploads > 0:
-            logging.warning(f"Vector indexing: {successful_uploads} succeeded, {failed_uploads} failed")
-        else:
-            logging.info(f"Successfully indexed {successful_uploads} document chunks")
-        
-    except Exception as e:
-        logging.error(f"Failed to index document batch: {str(e)}")
-        raise
-
-# Azure Function: Search API with RAG
-@app.function_name("SearchAPI")
-@app.route(route="search", methods=["GET", "POST"])
-async def search_api(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    RAG-powered search API using Gemini Flash 2.0
-    Provides intelligent search across CPUC regulatory documents
-    """
-    logging.info("Processing RAG search request")
+class RAGSearchAPI:
+    """RAG Search API"""
     
-    try:
-        await service_manager.initialize()
+    def __init__(self):
+        _, _, self.search_client, _ = get_azure_clients()
         
-        # Parse request parameters
-        if req.method == "GET":
-            query = req.params.get('q', '').strip()
-            top_k = int(req.params.get('top_k', '10'))
-        else:
-            req_body = req.get_json()
-            query = req_body.get('query', '').strip() if req_body else ''
-            top_k = int(req_body.get('top_k', 10)) if req_body else 10
-        
-        if not query:
-            return func.HttpResponse(
-                json.dumps({"error": "Search query parameter 'q' is required"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        # Perform RAG search
-        search_results = await perform_rag_search(query, top_k)
-        
-        # Generate AI response using Gemini Flash 2.0
-        ai_response = await generate_rag_response(query, search_results)
-        
-        # Format response
-        response_data = {
-            "query": query,
-            "ai_response": ai_response,
-            "source_documents": search_results,
-            "total_results": len(search_results),
-            "timestamp": datetime.now().isoformat(),
-            "model": GEMINI_MODEL_NAME
-        }
-        
-        return func.HttpResponse(
-            json.dumps(response_data, indent=2),
-            mimetype="application/json"
-        )
-        
-    except Exception as e:
-        logging.error(f"Search API failed: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({
-                "error": "Internal server error", 
-                "message": str(e),
-                "timestamp": datetime.now().isoformat()
-            }),
-            status_code=500,
-            mimetype="application/json"
-        )
-
-async def perform_rag_search(query: str, top_k: int = 10) -> List[Dict]:
-    """Perform RAG search using vector similarity and keyword search"""
-    try:
-        # Generate query embedding
-        query_embedding = await generate_embeddings_with_retry(query)
-        
-        if not query_embedding:
-            # Fallback to keyword search only
-            return await perform_keyword_search(query, top_k)
-        
-        # Perform hybrid search (vector + keyword)
-        vector_query = VectorizedQuery(
-            vector=query_embedding,
-            k_nearest_neighbors=top_k,
-            fields="content_vector"
-        )
-        
-        search_results = await service_manager.search_client.search(
-            search_text=query,
-            vector_queries=[vector_query],
-            select=[
-                "document_id", "proceeding_id", "filename", "content", 
-                "metadata", "blob_url", "chunk_index", "total_chunks"
-            ],
-            top=top_k,
-            query_type="semantic"
-        )
-        
-        # Format results
-        results = []
-        async for result in search_results:
-            metadata = json.loads(result.get("metadata", "{}"))
+    def search_documents(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        """Search documents"""
+        try:
+            if not self.search_client:
+                return {'query': query, 'results': [], 'error': 'Search client not available'}
             
-            formatted_result = {
-                "document_id": result["document_id"],
-                "proceeding_id": result["proceeding_id"],
-                "filename": result["filename"],
-                "content": result["content"],
-                "blob_url": result["blob_url"],
-                "relevance_score": result.get("@search.score", 0),
-                "chunk_info": {
-                    "chunk_index": result.get("chunk_index", 0),
-                    "total_chunks": result.get("total_chunks", 1)
-                },
-                "metadata": metadata
-            }
-            results.append(formatted_result)
-        
-        return results
-        
-    except Exception as e:
-        logging.error(f"RAG search failed: {str(e)}")
-        return []
-
-async def perform_keyword_search(query: str, top_k: int) -> List[Dict]:
-    """Fallback keyword search when vector search fails"""
-    try:
-        search_results = await service_manager.search_client.search(
-            search_text=query,
-            select=[
-                "document_id", "proceeding_id", "filename", "content", 
-                "metadata", "blob_url", "chunk_index", "total_chunks"
-            ],
-            top=top_k,
-            query_type="simple"
-        )
-        
-        results = []
-        async for result in search_results:
-            metadata = json.loads(result.get("metadata", "{}"))
+            query_embedding = genai.embed_content(
+                model="models/text-embedding-004",
+                content=query,
+                task_type="RETRIEVAL_QUERY"
+            )['embedding']
             
-            formatted_result = {
-                "document_id": result["document_id"],
-                "proceeding_id": result["proceeding_id"],
-                "filename": result["filename"],
-                "content": result["content"],
-                "blob_url": result["blob_url"],
-                "relevance_score": result.get("@search.score", 0),
-                "chunk_info": {
-                    "chunk_index": result.get("chunk_index", 0),
-                    "total_chunks": result.get("total_chunks", 1)
-                },
-                "metadata": metadata
-            }
-            results.append(formatted_result)
-        
-        return results
-        
-    except Exception as e:
-        logging.error(f"Keyword search failed: {str(e)}")
-        return []
-
-async def generate_rag_response(query: str, search_results: List[Dict]) -> str:
-    """Generate RAG response using Gemini Flash 2.0 with context"""
-    try:
-        if not search_results:
-            return "I couldn't find any relevant documents to answer your question. Please try rephrasing your query or using different keywords."
-        
-        # Prepare context from search results
-        context_parts = []
-        for i, result in enumerate(search_results[:5]):  # Use top 5 results
-            context_parts.append(
-                f"Document {i+1}: {result['filename']}\n"
-                f"Proceeding: {result['proceeding_id']}\n"
-                f"Content: {result['content'][:800]}...\n"
-                f"---"
+            vector_query = VectorizedQuery(
+                vector=query_embedding,
+                k_nearest_neighbors=top_k,
+                fields="content_vector"
             )
-        
-        context = "\n\n".join(context_parts)
-        
-        # Create RAG prompt
-        rag_prompt = f"""
-You are an expert assistant for CPUC (California Public Utilities Commission) regulatory document analysis. 
-Based on the following regulatory documents, provide a comprehensive, accurate answer to the user's question.
+            
+            results = self.search_client.search(
+                search_text=query,
+                vector_queries=[vector_query],
+                select=["title", "content", "proceeding_number", "url", "created_date"]
+            )
+            
+            documents = []
+            for result in results:
+                documents.append({
+                    'title': result.get('title', ''),
+                    'content': result.get('content', '')[:800],
+                    'proceeding_number': result.get('proceeding_number', ''),
+                    'url': result.get('url', ''),
+                    'score': result.get('@search.score', 0),
+                    'created_date': result.get('created_date', '')
+                })
+            
+            return {
+                'query': query,
+                'results': documents,
+                'total_results': len(documents)
+            }
+            
+        except Exception as e:
+            logging.error(f"Search failed: {str(e)}")
+            return {'query': query, 'results': [], 'error': str(e)}
+    
+    def generate_rag_response(self, query: str, context_docs: List[Dict]) -> str:
+        """Generate RAG response"""
+        try:
+            model = get_gemini_model()
+            if not model:
+                return "RAG response generation not available - Gemini model not initialized"
+            
+            context = "\n\n".join([
+                f"Document: {doc['title']}\nContent: {doc['content'][:400]}..."
+                for doc in context_docs[:3]
+            ])
+            
+            prompt = f"""Based on these CPUC regulatory documents, answer the question.
 
-User Question: {query}
-
-Relevant Document Excerpts:
+Context:
 {context}
 
-Instructions:
-1. Provide a detailed, professional response that directly answers the question
-2. Reference specific documents and proceeding IDs when relevant
-3. Explain regulatory implications and context where appropriate
-4. If the information is insufficient, clearly state what additional details would be needed
-5. Maintain accuracy and cite specific sections when possible
-6. Use professional language appropriate for regulatory analysis
+Question: {query}
 
-Response:
-"""
-        
-        # Generate response using Gemini Flash 2.0
-        response = await service_manager.gemini_client.generate_content(rag_prompt)
-        
-        return response.text
-        
-    except Exception as e:
-        logging.error(f"RAG response generation failed: {str(e)}")
-        return "I apologize, but I'm unable to generate a response at this time. Please try again later or contact system administrator."
+Please provide a comprehensive answer based on the regulatory documents. If insufficient information, please indicate so.
 
-# Azure Function: Health Check
-@app.function_name("HealthCheck")
-@app.route(route="health", methods=["GET"])
-async def health_check(req: func.HttpRequest) -> func.HttpResponse:
-    """Health check endpoint for monitoring system status"""
-    try:
-        await service_manager.initialize()
-        
-        # Test connections to all services
-        health_status = {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "services": {},
-            "pipeline_status": {}
-        }
-        
-        # Test Blob Storage
-        try:
-            container_client = service_manager.blob_client.get_container_client("proceedings-metadata")
-            await container_client.get_container_properties()
-            health_status["services"]["blob_storage"] = "healthy"
-        except Exception as e:
-            health_status["services"]["blob_storage"] = f"unhealthy: {str(e)}"
-        
-        # Test Search Service
-        try:
-            index_client = SearchIndexClient(
-                endpoint=SEARCH_SERVICE_ENDPOINT,
-                credential=AzureKeyCredential(SEARCH_API_KEY)
-            )
-            await index_client.get_index("grc-documents")
-            health_status["services"]["search_service"] = "healthy"
-        except Exception as e:
-            health_status["services"]["search_service"] = f"unhealthy: {str(e)}"
-        
-        # Test Gemini API
-        try:
-            test_embedding = await generate_embeddings_with_retry("test", max_retries=1)
-            if test_embedding:
-                health_status["services"]["gemini_api"] = "healthy"
-            else:
-                health_status["services"]["gemini_api"] = "unhealthy: no embedding returned"
-        except Exception as e:
-            health_status["services"]["gemini_api"] = f"unhealthy: {str(e)}"
-        
-        # Check pipeline status
-        try:
-            # Check recent proceedings data
-            container_client = service_manager.blob_client.get_container_client("proceedings-metadata")
-            blobs = []
-            async for blob in container_client.list_blobs():
-                if blob.name.startswith("proceedings_"):
-                    blobs.append(blob)
+Answer:"""
             
-            if blobs:
-                latest_blob = max(blobs, key=lambda b: b.last_modified)
-                hours_since_update = (datetime.now(latest_blob.last_modified.tzinfo) - latest_blob.last_modified).total_seconds() / 3600
-                
-                if hours_since_update < 48:  # Updated within 2 days
-                    health_status["pipeline_status"]["proceeding_scraper"] = "healthy"
-                else:
-                    health_status["pipeline_status"]["proceeding_scraper"] = f"stale: {hours_since_update:.1f} hours old"
-            else:
-                health_status["pipeline_status"]["proceeding_scraper"] = "no data found"
-                
+            response = model.generate_content(prompt)
+            return response.text
+            
         except Exception as e:
-            health_status["pipeline_status"]["proceeding_scraper"] = f"error: {str(e)}"
-        
-        # Determine overall status
-        service_issues = [v for v in health_status["services"].values() if not v == "healthy"]
-        pipeline_issues = [v for v in health_status["pipeline_status"].values() if not v == "healthy"]
-        
-        if service_issues or pipeline_issues:
-            health_status["status"] = "degraded"
-            health_status["issues"] = service_issues + pipeline_issues
-        
-        status_code = 200 if health_status["status"] == "healthy" else 503
-        
-        return func.HttpResponse(
-            json.dumps(health_status, indent=2),
-            status_code=status_code,
-            mimetype="application/json"
-        )
-        
-    except Exception as e:
-        logging.error(f"Health check failed: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({
-                "status": "unhealthy",
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }),
-            status_code=500,
-            mimetype="application/json"
-        )
+            logging.error(f"RAG response generation failed: {str(e)}")
+            return f"Error generating response: {str(e)}"
 
-# Azure Function: Manual Trigger for Development
-@app.function_name("ManualTrigger")
-@app.route(route="trigger/{step}", methods=["POST"])
-async def manual_trigger(req: func.HttpRequest) -> func.HttpResponse:
-    """Manual trigger for pipeline steps during development and testing"""
+# Initialize global instances
+scraper = CPUCProceedingScraper()
+downloader = DocumentDownloader()
+vector_builder = VectorDatabaseBuilder()
+rag_api = RAGSearchAPI()
+
+# HTTP ENDPOINTS - Using the working naming pattern
+
+@app.function_name(name="HttpTriggerHealth")
+@app.route(route="health", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET"])
+def health_check(req: func.HttpRequest) -> func.HttpResponse:
+    """Health check endpoint"""
+    logging.info("Health check called")
+    return func.HttpResponse(
+        json.dumps({
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "service": "GRCResponder Backend - Complete Version",
+            "version": "1.0.0"
+        }),
+        mimetype="application/json"
+    )
+
+@app.function_name(name="HttpTriggerSearch")
+@app.route(route="search", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "POST"])
+def search_documents_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """Search documents endpoint"""
     try:
-        step = req.route_params.get('step')
-        
-        if step == "scraper":
-            await proceeding_scraper(None)
-            message = "Proceeding scraper triggered successfully"
-        elif step == "downloader":
-            await document_downloader(None)
-            message = "Document downloader triggered successfully"
-        elif step == "vectorizer":
-            await vector_database_builder(None)
-            message = "Vector database builder triggered successfully"
-        else:
+        query = req.params.get('q') or req.params.get('query')
+        if not query:
             return func.HttpResponse(
-                json.dumps({"error": f"Unknown step: {step}. Use 'scraper', 'downloader', or 'vectorizer'"}),
+                json.dumps({"error": "Query parameter 'q' is required"}),
                 status_code=400,
                 mimetype="application/json"
             )
         
+        top_k = int(req.params.get('top_k', 5))
+        search_results = rag_api.search_documents(query, top_k)
+        
+        return func.HttpResponse(
+            json.dumps(search_results),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Search endpoint error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+@app.function_name(name="HttpTriggerAsk")
+@app.route(route="ask", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "POST"])
+def ask_question_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """RAG question answering endpoint"""
+    try:
+        query = req.params.get('q') or req.params.get('query')
+        if not query:
+            return func.HttpResponse(
+                json.dumps({"error": "Query parameter 'q' is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        search_results = rag_api.search_documents(query, top_k=5)
+        rag_response = rag_api.generate_rag_response(query, search_results['results'])
+        
         return func.HttpResponse(
             json.dumps({
-                "message": message,
-                "timestamp": datetime.now().isoformat()
+                "query": query,
+                "answer": rag_response,
+                "sources": search_results['results']
             }),
             mimetype="application/json"
         )
         
     except Exception as e:
-        logging.error(f"Manual trigger failed: {str(e)}")
+        logging.error(f"Ask endpoint error: {str(e)}")
         return func.HttpResponse(
-            json.dumps({
-                "error": "Manual trigger failed",
-                "message": str(e),
-                "timestamp": datetime.now().isoformat()
-            }),
+            json.dumps({"error": str(e)}),
             status_code=500,
             mimetype="application/json"
         )
+
+@app.function_name(name="HttpTriggerScrape")
+@app.route(route="scrape", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET", "POST"])
+def scrape_proceedings_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """Manual scraping trigger"""
+    try:
+        days_back = int(req.params.get('days', 30))
+        proceedings = scraper.scrape_recent_proceedings(days_back)
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "success",
+                "proceedings_found": len(proceedings),
+                "proceedings": proceedings[:5]
+            }),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Scrape endpoint error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+@app.function_name(name="HttpTriggerStatus")
+@app.route(route="status", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET"])
+def system_status(req: func.HttpRequest) -> func.HttpResponse:
+    """System status check"""
+    try:
+        kv_client, storage_client, search_client, search_index_client = get_azure_clients()
+        gemini_model = get_gemini_model()
+        
+        status = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "components": {
+                "key_vault": "available" if kv_client else "unavailable",
+                "storage": "available" if storage_client else "unavailable", 
+                "search": "available" if search_client else "unavailable",
+                "gemini": "available" if gemini_model else "unavailable"
+            }
+        }
+        
+        return func.HttpResponse(
+            json.dumps(status),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+@app.function_name(name="HttpTriggerPipeline")
+@app.route(route="pipeline", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def manual_pipeline_trigger(req: func.HttpRequest) -> func.HttpResponse:
+    """Manual pipeline execution"""
+    try:
+        logging.info("Manual pipeline execution started")
+        
+        proceedings = scraper.scrape_recent_proceedings(days_back=7)
+        logging.info(f"Found {len(proceedings)} proceedings")
+        
+        if not proceedings:
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "completed",
+                    "message": "No proceedings found",
+                    "proceedings_processed": 0,
+                    "documents_downloaded": 0
+                }),
+                mimetype="application/json"
+            )
+        
+        all_documents = []
+        for proceeding in proceedings[:3]:
+            documents = downloader.download_proceeding_documents(proceeding)
+            all_documents.extend(documents)
+        
+        logging.info(f"Downloaded {len(all_documents)} documents")
+        
+        if all_documents:
+            vector_builder.create_search_index()
+            vector_builder.index_documents(all_documents)
+        
+        return func.HttpResponse(
+            json.dumps({
+                "status": "completed",
+                "proceedings_processed": len(proceedings[:3]),
+                "documents_downloaded": len(all_documents),
+                "timestamp": datetime.utcnow().isoformat()
+            }),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Manual pipeline error: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+# TIMER FUNCTIONS
+
+@app.function_name(name="TimerTriggerDaily")
+@app.timer_trigger(schedule="0 0 2 * * *", arg_name="timer", run_on_startup=False)
+def daily_pipeline(timer: func.TimerRequest) -> None:
+    """Daily pipeline - 2 AM UTC"""
+    try:
+        logging.info("Starting daily pipeline")
+        
+        proceedings = scraper.scrape_recent_proceedings(days_back=7)
+        logging.info(f"Found {len(proceedings)} proceedings")
+        
+        if not proceedings:
+            return
+        
+        all_documents = []
+        for proceeding in proceedings[:3]:
+            documents = downloader.download_proceeding_documents(proceeding)
+            all_documents.extend(documents)
+        
+        logging.info(f"Downloaded {len(all_documents)} documents")
+        
+        if all_documents:
+            vector_builder.create_search_index()
+            vector_builder.index_documents(all_documents)
+        
+        logging.info("Daily pipeline completed")
+        
+    except Exception as e:
+        logging.error(f"Daily pipeline failed: {str(e)}")
+
+@app.function_name(name="TimerTriggerInit")
+@app.timer_trigger(schedule="0 0 3 * * SUN", arg_name="timer", run_on_startup=True)
+def initialize_system(timer: func.TimerRequest) -> None:
+    """System initialization"""
+    try:
+        logging.info("Initializing system")
+        vector_builder.create_search_index()
+        
+        _, storage_client, _, _ = get_azure_clients()
+        if storage_client:
+            try:
+                storage_client.create_container("documents")
+            except Exception:
+                pass
+        
+        logging.info("System initialized")
+        
+    except Exception as e:
+        logging.error(f"System initialization failed: {str(e)}")

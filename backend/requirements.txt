@@ -1,50 +1,24 @@
-# Azure Functions Core
+# Core Azure Functions
 azure-functions==1.18.0
-azure-functions-durable==1.2.9
 
-# Azure SDK Components
+# Basic Azure SDK Components  
 azure-storage-blob==12.19.0
 azure-keyvault-secrets==4.7.0
 azure-identity==1.15.0
-azure-search-documents==11.4.0
 azure-core==1.29.5
 
-# Google Gemini AI
-google-generativeai==0.3.2
-google-cloud-aiplatform==1.38.1
+# Azure Search
+azure-search-documents==11.4.0
 
-# HTTP and Web Scraping
-aiohttp==3.9.1
-requests==2.31.0
+# Web scraping
 beautifulsoup4==4.12.2
-lxml==4.9.3
 
 # PDF Processing
 PyPDF2==3.0.1
-pdfplumber==0.9.0
 
-# Data Processing
-numpy==1.24.4
-pandas==2.1.4
-
-# Text Processing
-nltk==3.8.1
-regex==2023.10.3
+# Google Gemini AI
+google-generativeai==0.3.2
 
 # Utilities
 python-dateutil==2.8.2
-uuid==1.30
-hashlib2==1.0.2
-
-# JSON and Data Handling
-orjson==3.9.10
-
-# Logging and Monitoring
-opencensus-extension-azure-monitor==1.1.13
-
-# Environment and Configuration
-python-dotenv==1.0.0
-
-# Async Support
-asyncio==3.4.3
-uvloop==0.19.0
+numpy==1.24.4
