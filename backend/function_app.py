@@ -102,7 +102,7 @@ def health_check(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name("SearchAPI")
 @app.route(route="search", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def search_api(req: func.HttpRequest) -> func.HttpResponse:
-    """Search API with Key Vault integration"""
+    """Search API with actual Gemini AI integration"""
     try:
         if req.method == "GET":
             query = req.params.get('q', '').strip()
@@ -118,12 +118,29 @@ def search_api(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"}
             )
         
+        # Get Gemini API key and make actual AI call
+        try:
+            credential = DefaultAzureCredential()
+            kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+            gemini_key = kv_client.get_secret("gemini-api-key").value
+            
+            # Configure and call Gemini
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            
+            # Make actual AI call
+            response = model.generate_content(f"Please provide a helpful response to this query: {query}")
+            ai_response = response.text
+            
+        except Exception as e:
+            ai_response = f"AI service temporarily unavailable. Error: {str(e)[:100]}"
+        
         response_data = {
             "query": query,
-            "ai_response": f"Storage + Key Vault ready! Your query '{query}' can now access secure configuration.",
+            "ai_response": ai_response,
             "timestamp": datetime.now().isoformat(),
-            "status": "keyvault_ready",
-            "next_step": "Add Azure Search and Gemini AI"
+            "status": "gemini_ai_active",
+            "model": "gemini-2.0-flash-exp"
         }
         
         return func.HttpResponse(
@@ -144,7 +161,7 @@ def search_api(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name("ChatAPI")
 @app.route(route="chat", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def chat_api(req: func.HttpRequest) -> func.HttpResponse:
-    """Chat API with secure configuration"""
+    """Chat API with actual Gemini AI"""
     try:
         req_body = req.get_json()
         if not req_body:
@@ -164,10 +181,28 @@ def chat_api(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"}
             )
         
+        # Get Gemini API key and make actual AI call
+        try:
+            credential = DefaultAzureCredential()
+            kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+            gemini_key = kv_client.get_secret("gemini-api-key").value
+            
+            # Configure and call Gemini
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            
+            # Make actual AI call
+            response = model.generate_content(f"You are a helpful assistant. Please respond to: {message}")
+            ai_response = response.text
+            
+        except Exception as e:
+            ai_response = f"AI service temporarily unavailable. Error: {str(e)[:100]}"
+        
         response_data = {
-            "response": f"Hello! You said: '{message}'. I now have secure access to configuration via Key Vault!",
+            "response": ai_response,
             "timestamp": datetime.now().isoformat(),
-            "status": "keyvault_integrated"
+            "status": "gemini_ai_active",
+            "model": "gemini-2.0-flash-exp"
         }
         
         return func.HttpResponse(
