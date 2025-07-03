@@ -2,43 +2,83 @@ import azure.functions as func
 import logging
 import json
 import os
+import google.generativeai as genai
 from datetime import datetime
 from typing import Dict, Any
 
-# Azure Storage import - now working!
+# Azure imports - now including Key Vault
 from azure.storage.blob import BlobServiceClient
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
+
+# Add these imports at the top
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+
 
 # Initialize Function App
 app = func.FunctionApp()
 
 # Configuration
 STORAGE_CONNECTION_STRING = os.environ.get('AzureWebJobsStorage')
+KEY_VAULT_URL = os.environ.get('KEY_VAULT_URL', 'https://grcresponder-dev-kv.vault.azure.net/')
+SEARCH_SERVICE_ENDPOINT = 'https://grcresponder-dev-search.search.windows.net'
 
 @app.function_name("HealthCheck")
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def health_check(req: func.HttpRequest) -> func.HttpResponse:
-    """Health check with actual Azure Storage test"""
+    """Health check with Azure Storage and Key Vault test"""
     try:
         health_status = {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
-            "message": "GRCResponder Function App with Azure Storage!",
-            "version": "2.0.0"
+            "message": "GRCResponder with Storage + Key Vault!",
+            "version": "2.1.0"
         }
         
-        # Test Azure Storage connection
-    # Test Azure Storage connection
+        # Test Azure Storage
         if STORAGE_CONNECTION_STRING:
             try:
                 blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
                 containers = list(blob_client.list_containers())
                 health_status["storage_status"] = "connected"
-                health_status["storage_containers"] = [c.name for c in containers[:5]]  # Limit to first 5
+                health_status["storage_containers"] = [c.name for c in containers[:5]]
             except Exception as e:
-                health_status["storage_status"] = f"error: {str(e)[:100]}"  # Limit error message length
-        else:
-            health_status["storage_status"] = "no_connection_string"
+                health_status["storage_status"] = f"error: {str(e)[:100]}"
         
+        # Test Azure Search (add this after Key Vault test)
+        try:
+            # For now, we'll skip Search test since we don't have the API key
+            # We'll get it from Key Vault in the next step
+            health_status["search_status"] = "endpoint_configured"
+            health_status["search_endpoint"] = SEARCH_SERVICE_ENDPOINT
+        except Exception as e:
+            health_status["search_status"] = f"error: {str(e)[:100]}"
+
+        # Initialize Key Vault client outside try blocks
+        credential = DefaultAzureCredential()
+        kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+
+        # Test Key Vault
+        try:
+            secret = kv_client.get_secret("gemini-api-key")
+            health_status["keyvault_status"] = "connected"
+            health_status["gemini_key_available"] = len(secret.value) > 0 if secret.value else False
+        except Exception as e:
+            health_status["keyvault_status"] = f"error: {str(e)[:100]}"
+
+        # Test Google Gemini AI (now kv_client is available)
+        try:
+            gemini_key = kv_client.get_secret("gemini-api-key").value
+            if gemini_key:
+                genai.configure(api_key=gemini_key)
+                health_status["gemini_status"] = "configured"
+                health_status["gemini_model"] = "gemini-2.0-flash-exp"
+            else:
+                health_status["gemini_status"] = "no_api_key"
+        except Exception as e:
+            health_status["gemini_status"] = f"error: {str(e)[:100]}"
+
         return func.HttpResponse(
             json.dumps(health_status, indent=2),
             status_code=200,
@@ -62,7 +102,7 @@ def health_check(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name("SearchAPI")
 @app.route(route="search", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def search_api(req: func.HttpRequest) -> func.HttpResponse:
-    """Search API with storage integration"""
+    """Search API with Key Vault integration"""
     try:
         if req.method == "GET":
             query = req.params.get('q', '').strip()
@@ -80,10 +120,10 @@ def search_api(req: func.HttpRequest) -> func.HttpResponse:
         
         response_data = {
             "query": query,
-            "ai_response": f"Azure Storage is working! Your query '{query}' can now be processed with full Azure backend support.",
+            "ai_response": f"Storage + Key Vault ready! Your query '{query}' can now access secure configuration.",
             "timestamp": datetime.now().isoformat(),
-            "status": "azure_storage_ready",
-            "next_step": "Add Key Vault and Search services"
+            "status": "keyvault_ready",
+            "next_step": "Add Azure Search and Gemini AI"
         }
         
         return func.HttpResponse(
@@ -104,7 +144,7 @@ def search_api(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name("ChatAPI")
 @app.route(route="chat", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def chat_api(req: func.HttpRequest) -> func.HttpResponse:
-    """Chat API with storage"""
+    """Chat API with secure configuration"""
     try:
         req_body = req.get_json()
         if not req_body:
@@ -125,9 +165,9 @@ def chat_api(req: func.HttpRequest) -> func.HttpResponse:
             )
         
         response_data = {
-            "response": f"Hello! You said: '{message}'. I'm now running with Azure Storage integration! Ready for the next step.",
+            "response": f"Hello! You said: '{message}'. I now have secure access to configuration via Key Vault!",
             "timestamp": datetime.now().isoformat(),
-            "status": "storage_integrated"
+            "status": "keyvault_integrated"
         }
         
         return func.HttpResponse(
@@ -148,22 +188,21 @@ def chat_api(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name("TestTrigger")
 @app.route(route="test", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def test_trigger(req: func.HttpRequest) -> func.HttpResponse:
-    """Test endpoint showing storage integration"""
+    """Test endpoint with Key Vault integration"""
     return func.HttpResponse(
         json.dumps({
-            "message": "🎉 Azure Storage Integration Complete!",
-            "step": "2.0 - Storage Working",
+            "message": "🔐 Azure Key Vault Integration Added!",
+            "step": "2.1 - Storage + Key Vault",
             "achievements": [
-                "✅ Azure Functions Core Tools installed",
-                "✅ Package installation working", 
-                "✅ Azure Storage connected",
-                "✅ Ready for next Azure services"
+                "✅ Azure Functions working",
+                "✅ Azure Storage connected", 
+                "✅ Azure Key Vault integrated",
+                "✅ Secure API key management"
             ],
             "next_steps": [
-                "Add Azure Key Vault",
-                "Add Azure Search", 
-                "Add Google Gemini AI",
-                "Add original GRC logic"
+                "Add Azure Search",
+                "Add Google Gemini AI", 
+                "Add original GRC retrieval logic"
             ],
             "timestamp": datetime.now().isoformat()
         }, indent=2),
