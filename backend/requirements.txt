@@ -1,24 +1,3 @@
-# Core Azure Functions
 azure-functions==1.18.0
-
-# Basic Azure SDK Components  
+requests==2.31.0
 azure-storage-blob==12.19.0
-azure-keyvault-secrets==4.7.0
-azure-identity==1.15.0
-azure-core==1.29.5
-
-# Azure Search
-azure-search-documents==11.4.0
-
-# Web scraping
-beautifulsoup4==4.12.2
-
-# PDF Processing
-PyPDF2==3.0.1
-
-# Google Gemini AI
-google-generativeai==0.3.2
-
-# Utilities
-python-dateutil==2.8.2
-numpy==1.24.4

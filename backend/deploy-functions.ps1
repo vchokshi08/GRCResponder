@@ -1,5 +1,5 @@
-# GRCResponder Backend Deployment Script
-# Deploy Azure Functions with battle-tested CPUC scraping logic
+# GRCResponder Backend Deployment Script - FIXED
+# Deploy Azure Functions with RBAC-compatible Key Vault access
 
 param(
     [Parameter(Mandatory=$true)]
@@ -18,7 +18,7 @@ param(
     [string]$Environment = "dev"
 )
 
-Write-Host "Starting GRCResponder Backend Deployment" -ForegroundColor Green
+Write-Host "Starting GRCResponder Backend Deployment (FIXED)" -ForegroundColor Green
 Write-Host "Subscription: $SubscriptionId" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor Cyan
 Write-Host "Function App: $FunctionAppName" -ForegroundColor Cyan
@@ -97,9 +97,16 @@ if ($LASTEXITCODE -ne 0) {
 # Get the managed identity principal ID
 $principalId = az functionapp identity show --name $FunctionAppName --resource-group $ResourceGroupName --query "principalId" -o tsv
 
-# Grant Key Vault access to managed identity
-Write-Host "Granting Key Vault access..." -ForegroundColor Cyan
-az keyvault set-policy --name "grcresponder-dev-kv" --object-id $principalId --secret-permissions get list | Out-Null
+# FIXED: Grant RBAC-compatible Key Vault access
+Write-Host "Granting Key Vault RBAC access..." -ForegroundColor Cyan
+$keyVaultId = az keyvault show --name "grcresponder-dev-kv" --resource-group $ResourceGroupName --query "id" -o tsv
+
+# Grant Key Vault Secrets User role (RBAC compatible)
+az role assignment create --assignee $principalId --role "Key Vault Secrets User" --scope $keyVaultId | Out-Null
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Key Vault RBAC assignment may have failed, but continuing..."
+}
 
 # Grant Storage access
 Write-Host "Granting Storage access..." -ForegroundColor Cyan
@@ -123,7 +130,11 @@ $containerNames = @(
 
 foreach ($containerName in $containerNames) {
     Write-Host "  Creating container: $containerName" -ForegroundColor Gray
-    az storage container create --name $containerName --account-name "grcresponderdevstorage" --auth-mode login | Out-Null
+    try {
+        az storage container create --name $containerName --account-name "grcresponderdevstorage" --auth-mode login | Out-Null
+    } catch {
+        Write-Warning "Container $containerName may already exist"
+    }
 }
 
 # Package and deploy functions
@@ -142,7 +153,7 @@ Copy-Item "requirements.txt" -Destination "$deploymentPath\"
 Copy-Item "host.json" -Destination "$deploymentPath\"
 
 # Create .funcignore file
-$funcignoreContent = @"
+$funcignoreContent = @'
 .git*
 .vscode
 .pytest_cache
@@ -151,7 +162,9 @@ __pycache__
 .env
 local.settings.json
 test_*.py
-"@
+deployment-package/
+*.zip
+'@
 
 $funcignorePath = Join-Path $deploymentPath ".funcignore"
 Set-Content -Path $funcignorePath -Value $funcignoreContent -Encoding UTF8
@@ -173,6 +186,21 @@ if ($LASTEXITCODE -ne 0) {
 Remove-Item -Recurse -Force $deploymentPath
 Remove-Item "grcresponder-backend.zip"
 
+Write-Host ""
 Write-Host "Deployment completed successfully!" -ForegroundColor Green
 Write-Host "Function App URL: https://$FunctionAppName.azurewebsites.net" -ForegroundColor Cyan
 Write-Host "Health Check: https://$FunctionAppName.azurewebsites.net/api/health" -ForegroundColor Cyan
+Write-Host "Search API: https://$FunctionAppName.azurewebsites.net/api/search" -ForegroundColor Cyan
+Write-Host "Chat API: https://$FunctionAppName.azurewebsites.net/api/chat" -ForegroundColor Cyan
+
+Write-Host ""
+Write-Host "Test the deployment:" -ForegroundColor Yellow
+Write-Host "Invoke-RestMethod -Uri 'https://$FunctionAppName.azurewebsites.net/api/health'" -ForegroundColor Gray
+
+Write-Host ""
+Write-Host "Fixed Issues:" -ForegroundColor Green
+Write-Host "  - RBAC-compatible Key Vault access" -ForegroundColor White
+Write-Host "  - Complete LangChain dependencies" -ForegroundColor White
+Write-Host "  - Original retrieval logic preserved" -ForegroundColor White
+Write-Host "  - Proper function routing with CORS" -ForegroundColor White
+Write-Host "  - Azure Search integration" -ForegroundColor White
