@@ -6,3 +6,5 @@ azure-identity==1.15.0
 azure-search-documents==11.4.0
 azure-core==1.29.5
 google-generativeai==0.3.2
+beautifulsoup4==4.12.2
+aiohttp==3.9.1
