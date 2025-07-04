@@ -39,6 +39,11 @@ MAX_CONCURRENT_DOWNLOADS = 5
 CHUNK_SIZE = 1000  # characters for text chunking
 CHUNK_OVERLAP = 200
 
+# Initialize Blob Service Client
+blob_service_client = BlobServiceClient.from_connection_string(os.environ["AzureWebJobsStorage"])
+container_client = blob_service_client.get_container_client("documents")
+
+
 # ADD MISSING SERVICE MANAGER CLASS
 class ServiceManager:
     """Simple service manager for Azure services"""
@@ -91,6 +96,40 @@ class ServiceManager:
 
 # CREATE GLOBAL SERVICE MANAGER INSTANCE
 service_manager = ServiceManager()
+
+@app.route(route="upload_document", auth_level=func.AuthLevel.ANONYMOUS)
+def upload_document(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        # Get the uploaded file
+        file = req.files.get('file')
+        if not file:
+            return func.HttpResponse("No file uploaded", status_code=400)
+
+        # Validate file is a PDF
+        if not file.filename.endswith('.pdf'):
+            return func.HttpResponse("Only PDF files are supported", status_code=400)
+
+        # Read PDF content
+        pdf_file = io.BytesIO(file.read())
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() or ""
+
+        # Upload PDF to Azure Blob Storage
+        blob_client = container_client.get_blob_client(file.filename)
+        blob_client.upload_blob(pdf_file.getvalue(), overwrite=True)
+
+        # Return extracted text
+        return func.HttpResponse(
+            json.dumps({"text": text}),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Error in upload_document: {str(e)}")
+        return func.HttpResponse(f"Error processing file: {str(e)}", status_code=500)
 
 @app.function_name("HealthCheck")
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
