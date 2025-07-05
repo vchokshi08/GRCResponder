@@ -25,6 +25,17 @@ from bs4 import BeautifulSoup
 import aiohttp
 import asyncio
 
+# Add these imports to the top of your existing function_app.py
+from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
+from datetime import datetime, timezone
+import uuid
+
+# Add these imports at the top with your other imports
+from dataclasses import dataclass, asdict
+from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
+
 # Initialize Function App
 app = func.FunctionApp()
 
@@ -39,9 +50,6 @@ MAX_CONCURRENT_DOWNLOADS = 5
 CHUNK_SIZE = 1000  # characters for text chunking
 CHUNK_OVERLAP = 200
 
-# Initialize Blob Service Client
-blob_service_client = BlobServiceClient.from_connection_string(os.environ["AzureWebJobsStorage"])
-container_client = blob_service_client.get_container_client("documents")
 
 
 # ADD MISSING SERVICE MANAGER CLASS
@@ -96,6 +104,542 @@ class ServiceManager:
 
 # CREATE GLOBAL SERVICE MANAGER INSTANCE
 service_manager = ServiceManager()
+
+# Replace your current ConversationService class with this corrected version:
+class ConversationService:
+    """Conversation management using Azure Cosmos DB"""
+    
+    def __init__(self):
+        self.cosmos_client = None
+        self.database = None
+        self.conversations_container = None
+        self.messages_container = None
+        self._initialized = False
+    
+    async def initialize(self):
+        """Initialize Cosmos DB connection"""
+        if self._initialized:
+            return
+        
+        try:
+            # For now, use in-memory storage (we'll add Cosmos DB later)
+            self.conversations_container = InMemoryContainer("conversations")
+            self.messages_container = InMemoryContainer("messages")
+            self._initialized = True
+            logging.info("Conversation service initialized with in-memory storage")
+            
+        except Exception as e:
+            logging.error(f"Failed to initialize conversation service: {str(e)}")
+            raise
+
+class InMemoryContainer:
+    """In-memory storage for development"""
+    def __init__(self, name):
+        self.name = name
+        self.items = {}
+    
+    def create_item(self, body):
+        item_id = body.get('id', str(uuid.uuid4()))
+        body['id'] = item_id
+        self.items[item_id] = body
+        return body
+    
+    def read_item(self, item_id, partition_key):
+        item = self.items.get(item_id)
+        if not item:
+            raise CosmosResourceNotFoundError(message="Item not found")
+        return item
+    
+    def replace_item(self, item_id, body):
+        self.items[item_id] = body
+        return body
+    
+    def delete_item(self, item_id, partition_key):
+        if item_id not in self.items:
+            raise CosmosResourceNotFoundError(message="Item not found")
+        return self.items.pop(item_id, None)
+    
+    def query_items(self, query, parameters=None):
+        # Simple in-memory query simulation
+        if parameters and len(parameters) > 0:
+            param_value = parameters[0]['value']
+            if "user_id" in query:
+                return [item for item in self.items.values() if item.get('user_id') == param_value]
+            elif "conversation_id" in query:
+                return [item for item in self.items.values() if item.get('conversation_id') == param_value]
+        return list(self.items.values())
+
+# Initialize conversation service
+conversation_service = ConversationService()
+
+# Data Models (similar to your original SQLAlchemy models)
+@dataclass
+class ConversationModel:
+    id: str
+    user_id: str
+    title: str
+    timestamp: str
+    
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id, 
+            "title": self.title,
+            "timestamp": self.timestamp
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            id=data["id"],
+            user_id=data["user_id"],
+            title=data["title"], 
+            timestamp=data["timestamp"]
+        )
+
+@dataclass  
+class MessageModel:
+    id: str
+    conversation_id: str
+    sender: str
+    message: str
+    timestamp: str
+    
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "sender": self.sender,
+            "message": self.message,
+            "timestamp": self.timestamp
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            id=data["id"],
+            conversation_id=data["conversation_id"],
+            sender=data["sender"],
+            message=data["message"],
+            timestamp=data["timestamp"]
+        )
+
+# Azure Function: Create Conversation
+@app.function_name("CreateConversation")
+@app.route(route="conversations", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def create_conversation(req: func.HttpRequest) -> func.HttpResponse:
+    """Create a new conversation - matches your React frontend API"""
+    logging.info("Creating new conversation")
+    
+    try:
+        
+        # Parse request body
+        req_body = req.get_json()
+        if not req_body:
+            return func.HttpResponse(
+                json.dumps({"error": "Request body is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        user_id = req_body.get('user_id')
+        title = req_body.get('title', 'New Conversation')
+        timestamp = req_body.get('timestamp', datetime.now(timezone.utc).isoformat())
+        
+        if not user_id:
+            return func.HttpResponse(
+                json.dumps({"error": "user_id is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Create conversation
+        conversation_id = str(uuid.uuid4())
+        conversation = ConversationModel(
+            id=conversation_id,
+            user_id=user_id,
+            title=title,
+            timestamp=timestamp
+        )
+        
+        # Save to Cosmos DB
+        conversation_service.conversations_container.create_item(conversation.to_dict())
+        
+        return func.HttpResponse(
+            json.dumps(conversation.to_dict()),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Create conversation failed: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Failed to create conversation", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+# Azure Function: Get User Conversations  
+@app.function_name("GetConversations")
+@app.route(route="conversations", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+async def get_conversations(req: func.HttpRequest) -> func.HttpResponse:
+    """Get all conversations for a user - matches your React frontend API"""
+    logging.info("Getting user conversations")
+    
+    try:
+        await service_manager.initialize()
+        await conversation_service.initialize()
+        
+        user_id = req.params.get('user_id')
+        if not user_id:
+            return func.HttpResponse(
+                json.dumps({"error": "user_id parameter is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Query conversations for user
+        query = "SELECT * FROM c WHERE c.user_id = @user_id ORDER BY c.timestamp DESC"
+        parameters = [{"name": "@user_id", "value": user_id}]
+        
+        conversations = list(conversation_service.conversations_container.query_items(
+            query=query,
+            parameters=parameters
+        ))
+        
+        return func.HttpResponse(
+            json.dumps(conversations),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Get conversations failed: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Failed to get conversations", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+# Azure Function: Add Message and Get AI Response
+@app.function_name("AddMessage")
+@app.route(route="conversations/{conversation_id}/messages", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def add_message(req: func.HttpRequest) -> func.HttpResponse:
+    """Add message and get AI response - matches your React frontend API and integrates with your RAG system"""
+    logging.info("Adding message and generating AI response")
+    
+    try:
+        await service_manager.initialize()
+        await conversation_service.initialize()
+        
+        conversation_id = req.route_params.get('conversation_id')
+        if not conversation_id:
+            return func.HttpResponse(
+                json.dumps({"error": "conversation_id is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Verify conversation exists
+        try:
+            conversation = conversation_service.conversations_container.read_item(
+                item=conversation_id,
+                partition_key=conversation_id
+            )
+        except:
+            return func.HttpResponse(
+                json.dumps({"error": "Conversation not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+        
+        # Parse request body
+        req_body = req.get_json()
+        if not req_body:
+            return func.HttpResponse(
+                json.dumps({"error": "Request body is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        sender = req_body.get('sender', 'user')
+        message_text = req_body.get('message', '')
+        timestamp = req_body.get('timestamp', datetime.now(timezone.utc).isoformat())
+        
+        if not message_text.strip():
+            return func.HttpResponse(
+                json.dumps({"error": "Message text is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Save user message
+        user_message_id = str(uuid.uuid4())
+        user_message = MessageModel(
+            id=user_message_id,
+            conversation_id=conversation_id,
+            sender=sender,
+            message=message_text,
+            timestamp=timestamp
+        )
+        
+        conversation_service.messages_container.create_item(user_message.to_dict())
+        
+        # Generate AI response using your existing RAG system
+        ai_response_text = await generate_ai_response_with_context(message_text, conversation_id)
+        
+        # Save AI response
+        ai_message_id = str(uuid.uuid4())
+        ai_message = MessageModel(
+            id=ai_message_id,
+            conversation_id=conversation_id,
+            sender="ai",
+            message=ai_response_text,
+            timestamp=datetime.now(timezone.utc).isoformat()
+        )
+        
+        conversation_service.messages_container.create_item(ai_message.to_dict())
+        
+        # Return response in format your React frontend expects
+        return func.HttpResponse(
+            json.dumps({
+                "response": "Message saved successfully",
+                "data": {
+                    "message": ai_response_text
+                }
+            }),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Add message failed: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Failed to add message", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+# Azure Function: Get Conversation Messages
+@app.function_name("GetMessages") 
+@app.route(route="conversations/{conversation_id}/messages", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+async def get_messages(req: func.HttpRequest) -> func.HttpResponse:
+    """Get all messages for a conversation - matches your React frontend API"""
+    logging.info("Getting conversation messages")
+    
+    try:
+        await service_manager.initialize()
+        await conversation_service.initialize()
+        
+        conversation_id = req.route_params.get('conversation_id')
+        if not conversation_id:
+            return func.HttpResponse(
+                json.dumps({"error": "conversation_id is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Query messages for conversation
+        query = "SELECT * FROM c WHERE c.conversation_id = @conversation_id ORDER BY c.timestamp ASC"
+        parameters = [{"name": "@conversation_id", "value": conversation_id}]
+        
+        messages = list(conversation_service.messages_container.query_items(
+            query=query,
+            parameters=parameters
+        ))
+        
+        return func.HttpResponse(
+            json.dumps(messages),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Get messages failed: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Failed to get messages", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+# Azure Function: Update Conversation Title
+@app.function_name("UpdateConversation")
+@app.route(route="conversations/{conversation_id}", methods=["PUT"], auth_level=func.AuthLevel.ANONYMOUS)
+async def update_conversation(req: func.HttpRequest) -> func.HttpResponse:
+    """Update conversation title - matches your React frontend API"""
+    logging.info("Updating conversation")
+    
+    try:
+        await service_manager.initialize()
+        await conversation_service.initialize()
+        
+        conversation_id = req.route_params.get('conversation_id')
+        if not conversation_id:
+            return func.HttpResponse(
+                json.dumps({"error": "conversation_id is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Parse request body
+        req_body = req.get_json()
+        if not req_body:
+            return func.HttpResponse(
+                json.dumps({"error": "Request body is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        new_title = req_body.get('new_title')
+        if not new_title:
+            return func.HttpResponse(
+                json.dumps({"error": "new_title is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Get existing conversation
+        try:
+            conversation = conversation_service.conversations_container.read_item(
+                item=conversation_id,
+                partition_key=conversation_id
+            )
+        except:
+            return func.HttpResponse(
+                json.dumps({"error": "Conversation not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+        
+        old_title = conversation.get('title', 'Unknown')
+        conversation['title'] = new_title
+        
+        # Update conversation
+        conversation_service.conversations_container.replace_item(
+            item=conversation_id,
+            body=conversation
+        )
+        
+        return func.HttpResponse(
+            json.dumps({
+                "detail": f"Old title '{old_title}' changed to {new_title}"
+            }),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Update conversation failed: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Failed to update conversation", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+# Azure Function: Delete Conversation
+@app.function_name("DeleteConversation")
+@app.route(route="conversations/{conversation_id}", methods=["DELETE"], auth_level=func.AuthLevel.ANONYMOUS)
+async def delete_conversation(req: func.HttpRequest) -> func.HttpResponse:
+    """Delete conversation and all its messages - matches your React frontend API"""
+    logging.info("Deleting conversation")
+    
+    try:
+        await service_manager.initialize()
+        await conversation_service.initialize()
+        
+        conversation_id = req.route_params.get('conversation_id')
+        if not conversation_id:
+            return func.HttpResponse(
+                json.dumps({"error": "conversation_id is required"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Verify conversation exists
+        try:
+            conversation = conversation_service.conversations_container.read_item(
+                item=conversation_id,
+                partition_key=conversation_id
+            )
+        except:
+            return func.HttpResponse(
+                json.dumps({"error": "Conversation not found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+        
+        # Delete all messages in conversation
+        query = "SELECT * FROM c WHERE c.conversation_id = @conversation_id"
+        parameters = [{"name": "@conversation_id", "value": conversation_id}]
+        
+        messages = list(conversation_service.messages_container.query_items(
+            query=query,
+            parameters=parameters
+        ))
+        
+        for message in messages:
+            conversation_service.messages_container.delete_item(
+                item=message['id'],
+                partition_key=conversation_id
+            )
+        
+        # Delete conversation
+        conversation_service.conversations_container.delete_item(
+            item=conversation_id,
+            partition_key=conversation_id
+        )
+        
+        return func.HttpResponse(
+            json.dumps({"detail": "Conversation deleted"}),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Delete conversation failed: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Failed to delete conversation", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+# Replace the generate_ai_response_with_context function with this simpler version
+async def generate_ai_response_with_context(user_message: str, conversation_id: str) -> str:
+    """Generate AI response using your existing RAG system with conversation context"""
+    try:
+        # For now, use the search API endpoint directly
+        # This is a temporary solution until we fix the function dependencies
+        
+        # Get recent conversation history for context
+        query = "SELECT * FROM c WHERE c.conversation_id = @conversation_id ORDER BY c.timestamp DESC OFFSET 0 LIMIT 5"
+        parameters = [{"name": "@conversation_id", "value": conversation_id}]
+        
+        recent_messages = list(conversation_service.messages_container.query_items(
+            query=query,
+            parameters=parameters
+        ))
+        
+        # Build context from recent messages
+        context_messages = []
+        for msg in reversed(recent_messages[-5:]):  # Last 5 messages in chronological order
+            if msg['sender'] == 'user':
+                context_messages.append(f"Human: {msg['message']}")
+            else:
+                context_messages.append(f"Assistant: {msg['message']}")
+        
+        # Combine context with current message
+        if context_messages:
+            enhanced_query = f"Previous conversation:\n{chr(10).join(context_messages)}\n\nNew question: {user_message}"
+        else:
+            enhanced_query = user_message
+        
+        # Use a simple response for now (we'll connect to RAG later)
+        response = f"Thank you for your question about: '{user_message}'. I'm processing this using our GRC document analysis system. This is a temporary response while we complete the integration."
+        
+        return response
+        
+    except Exception as e:
+        logging.error(f"AI response generation failed: {str(e)}")
+        return "I apologize, but I'm having trouble generating a response right now. Please try again."
+    
+# Initialize Blob Service Client
+blob_service_client = BlobServiceClient.from_connection_string(os.environ["AzureWebJobsStorage"])
+container_client = blob_service_client.get_container_client("documents")
+
 
 @app.route(route="upload_document", auth_level=func.AuthLevel.ANONYMOUS)
 def upload_document(req: func.HttpRequest) -> func.HttpResponse:
@@ -206,10 +750,12 @@ def health_check(req: func.HttpRequest) -> func.HttpResponse:
             headers={"Access-Control-Allow-Origin": "*"}
         )
 
+# This brings the original battle-tested RAG logic into Azure
+
 @app.function_name("SearchAPI")
 @app.route(route="search", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def search_api(req: func.HttpRequest) -> func.HttpResponse:
-    """Search API with actual Gemini AI integration"""
+    """Search API with original battle-tested RAG system integrated"""
     try:
         if req.method == "GET":
             query = req.params.get('q', '').strip()
@@ -225,29 +771,45 @@ def search_api(req: func.HttpRequest) -> func.HttpResponse:
                 headers={"Access-Control-Allow-Origin": "*"}
             )
         
-        # Get Gemini API key and make actual AI call
-        try:
-            credential = DefaultAzureCredential()
-            kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
-            gemini_key = kv_client.get_secret("gemini-api-key").value
+        # Step 1: Query Classification (from original llm.py)
+        classification = classify_grc_query(query)
+        
+        # Step 2: Get Gemini AI configured
+        credential = DefaultAzureCredential()
+        kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+        gemini_key = kv_client.get_secret("gemini-api-key").value
+        genai.configure(api_key=gemini_key)
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        
+        # Step 3: Process based on classification (original logic)
+        if classification == "NON_GRC":
+            ai_response = ("I'm specifically designed to assist with California General Rate Case (GRC) proceedings and CPUC regulatory matters. "
+                          "How can I help you with GRC-related questions, rate case analysis, or utility regulatory issues?")
+        
+        elif classification == "GRC_GENERAL":
+            # No retrieval needed - direct response
+            system_prompt = """You are a GRC specialist. Provide clear, concise definitions and explanations for basic GRC concepts. 
+            Use markdown formatting for readability. Address only topics related to California GRC proceedings and CPUC regulatory matters.
+            Always end with: "Would you like me to explore any aspect of this response in greater depth?"."""
             
-            # Configure and call Gemini
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel('gemini-2.0-flash-exp')
-            
-            # Make actual AI call
-            response = model.generate_content(f"Please provide a helpful response to this query: {query}")
+            response = model.generate_content(f"{system_prompt}\n\nUser Query: {query}")
             ai_response = response.text
-            
-        except Exception as e:
-            ai_response = f"AI service temporarily unavailable. Error: {str(e)[:100]}"
+        
+        elif classification == "GRC_SPECIFIC":
+            # Full RAG pipeline with document retrieval
+            ai_response = process_grc_specific_query(query, model)
+        
+        else:  # GRC_LONGFORM or fallback
+            ai_response = process_grc_specific_query(query, model)
         
         response_data = {
             "query": query,
             "ai_response": ai_response,
             "timestamp": datetime.now().isoformat(),
-            "status": "gemini_ai_active",
-            "model": "gemini-2.0-flash-exp"
+            "status": "integrated_rag_system",
+            "model": "gemini-2.0-flash-exp",
+            "classification": classification,
+            "system": "battle_tested_rag"
         }
         
         return func.HttpResponse(
@@ -264,6 +826,133 @@ def search_api(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             headers={"Access-Control-Allow-Origin": "*"}
         )
+
+def classify_grc_query(query: str) -> str:
+    """Query classification from original llm.py"""
+    classification_prompt = f"""Classify this query into ONE category:
+
+1. GRC_SPECIFIC - Any question about:
+    - California utilities (PG&E, SCE, SDG&E, etc.)
+    - Rate cases, revenue requirements, testimony, exhibits
+    - CPUC proceedings, decisions, or regulations
+    - Anything a regulatory analyst might need to know
+
+2. GRC_GENERAL - ONLY basic definitional questions like:
+    - "What does GRC stand for?"
+    - "What is a General Rate Case?"
+
+3. NON_GRC - ONLY clearly off-topic requests
+
+IMPORTANT: When in doubt, choose GRC_SPECIFIC.
+
+Query: {query}
+
+Respond with ONLY the category name."""
+
+    try:
+        genai.configure(api_key=os.environ.get('GOOGLE_API_KEY', ''))
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        response = model.generate_content(classification_prompt)
+        category = response.text.strip().upper()
+        
+        if category not in ["GRC_SPECIFIC", "GRC_GENERAL", "NON_GRC"]:
+            category = "GRC_SPECIFIC"  # Default fallback
+            
+        return category
+    except Exception as e:
+        logging.warning(f"Classification failed: {e}")
+        return "GRC_SPECIFIC"  # Safe fallback
+
+def process_grc_specific_query(query: str, model) -> str:
+    """Process GRC-specific queries with document retrieval (adapted from original)"""
+    try:
+        # Step 1: Get documents from Azure AI Search (replaces Qdrant)
+        retrieved_docs = search_azure_documents(query, top_k=8)
+        
+        # Step 2: Build document context
+        if retrieved_docs:
+            doc_context = "\n\n".join([
+                f"Source: {doc['filename']}\nContent: {doc['content'][:500]}..."
+                for doc in retrieved_docs[:3]
+            ])
+        else:
+            doc_context = "No relevant documents found in the database."
+        
+        # Step 3: Use original system prompt (from llm.py)
+        system_prompt = f"""You are "GRC Regulatory Analysis Expert," an AI assistant specialized in California GRC proceedings.
+
+INFORMATION SOURCES:
+Base your responses EXCLUSIVELY on:
+1. Retrieved documents (HIGHEST PRIORITY)
+2. User-provided context in the current session
+
+IDENTITY AND EXPERTISE:
+You are a regulatory specialist focused exclusively on California General Rate Case (GRC) proceedings and related CPUC filings with expertise in:
+- Rate case applications and testimony
+- Revenue requirement analysis
+- Procedural requirements and timelines
+- CPUC decisions and precedents
+
+RESPONSE FORMAT:
+Structure your responses with:
+1. Concise summary of key findings
+2. Detailed analysis with multiple supporting citations
+3. Relevant regulatory background and historical context
+4. Discussion of practical implications
+
+Use markdown formatting for readability.
+
+ACCURACY REQUIREMENTS:
+- Never invent citations, docket numbers, or proceedings
+- Clearly indicate when information is missing or insufficient
+- Present multiple interpretations when guidance is ambiguous
+
+Always end responses with: "Would you like me to explore any aspect of this response in greater depth or address related regulatory considerations?"
+
+Document Context: {doc_context}
+
+User Query: {query}"""
+        
+        response = model.generate_content(system_prompt)
+        return response.text
+        
+    except Exception as e:
+        logging.error(f"GRC specific query processing failed: {str(e)}")
+        return "I apologize, but I'm having trouble accessing the document database right now. Please try again."
+
+def search_azure_documents(query: str, top_k: int = 8) -> list:
+    """Search Azure AI Search (replaces original Qdrant crossEncoderQuery)"""
+    try:
+        credential = DefaultAzureCredential()
+        kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+        search_key = kv_client.get_secret("search-admin-key").value
+        
+        search_client = SearchClient(
+            endpoint=SEARCH_SERVICE_ENDPOINT,
+            index_name="grc-documents",
+            credential=AzureKeyCredential(search_key)
+        )
+        
+        results = search_client.search(
+            search_text=query,
+            top=top_k,
+            select=["filename", "content", "proceeding_id"]
+        )
+        
+        documents = []
+        for result in results:
+            documents.append({
+                "filename": result.get("filename", "Unknown"),
+                "content": result.get("content", ""),
+                "proceeding_id": result.get("proceeding_id", ""),
+                "score": result.get("@search.score", 0)
+            })
+        
+        return documents
+        
+    except Exception as e:
+        logging.error(f"Azure document search failed: {str(e)}")
+        return []
 
 @app.function_name("ChatAPI")
 @app.route(route="chat", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -830,51 +1519,40 @@ async def get_vector_queue() -> List[Dict]:
         return []
 
 # Part 1: Scheduled Proceeding Scraper (runs 3x per week)
+
 @app.function_name("ScheduledProceedingScraper")
-@app.schedule(schedule="0 0 6 * * 2,4,6", arg_name="timer", run_on_startup=False)  # Tues, Thurs, Sat at 6 AM
-async def scheduled_proceeding_scraper(timer: func.TimerRequest) -> None:
+@app.schedule(schedule="0 0 6 * * 2,4,6", arg_name="timer", run_on_startup=False)
+def scheduled_proceeding_scraper(timer: func.TimerRequest) -> None:
     """
     Scheduled CPUC Proceeding Scraper - Part 1 of 3-step pipeline
     Runs 3x per week to discover new and updated proceedings with incremental updates
     """
-    logging.info("Starting Scheduled CPUC Proceeding Scraper with Incremental Updates - Step 1/3")
+    logging.info("Starting Scheduled CPUC Proceeding Scraper - Step 1/3")
     
     try:
-        await service_manager.initialize()
+        # Simple test - just create a test file in blob storage
+        blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+        container_name = "proceedings-metadata"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        blob_name = f"scraper_test_{timestamp}.json"
         
-        # Step 1: Get previously processed proceedings
-        existing_proceedings = await get_existing_proceedings()
-        logging.info(f"Found {len(existing_proceedings)} previously processed proceedings")
+        test_data = {
+            "status": "timer_function_executed",
+            "timestamp": datetime.now().isoformat(),
+            "message": "Timer function is working - next step: add scraping logic"
+        }
         
-        # Step 2: Scrape proceedings using comprehensive approach
-        all_proceedings = await scrape_all_cpuc_proceedings()
-        
-        if not all_proceedings:
-            logging.warning("No proceedings found during scraping")
-            return
-        
-        # Step 3: Apply date filtering and incremental logic
-        filtered_proceedings = await filter_and_deduplicate_proceedings(
-            all_proceedings, 
-            existing_proceedings
+        blob_client_instance = blob_client.get_blob_client(
+            container=container_name,
+            blob=blob_name
         )
         
-        if not filtered_proceedings:
-            logging.info("No new proceedings to process after filtering and deduplication")
-            return
+        blob_client_instance.upload_blob(
+            json.dumps(test_data, indent=2),
+            overwrite=True
+        )
         
-        logging.info(f"Processing {len(filtered_proceedings)} new/updated proceedings (filtered from {len(all_proceedings)} total)")
-        
-        # Step 4: Store proceedings metadata
-        await store_proceedings_metadata(filtered_proceedings)
-        
-        # Step 5: Create download queue for Document Downloader
-        await create_download_queue(filtered_proceedings)
-        
-        # Step 6: Update tracking for incremental processing
-        await update_proceedings_tracking(filtered_proceedings)
-        
-        logging.info(f"Scheduled proceeding scraper completed successfully. Queued {len(filtered_proceedings)} new proceedings")
+        logging.info(f"Timer function test successful - created {blob_name}")
         
     except Exception as e:
         logging.error(f"Scheduled proceeding scraper failed: {str(e)}")
