@@ -35,6 +35,7 @@ import uuid
 from dataclasses import dataclass, asdict
 from azure.cosmos import CosmosClient, PartitionKey
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
+from typing import Optional
 
 # Initialize Function App
 app = func.FunctionApp()
@@ -50,6 +51,32 @@ MAX_CONCURRENT_DOWNLOADS = 5
 CHUNK_SIZE = 1000  # characters for text chunking
 CHUNK_OVERLAP = 200
 
+@dataclass
+class Conversation:
+    id: str
+    user_id: str
+    title: str
+    timestamp: str
+    last_updated: str = None
+    message_count: int = 0
+    
+    def __post_init__(self):
+        if self.last_updated is None:
+            self.last_updated = self.timestamp
+
+
+@dataclass
+class Message:
+    id: str
+    conversation_id: str
+    sender: str  # "user" or "assistant"
+    message: str
+    timestamp: str
+    sources: List[Dict] = None
+    
+    def __post_init__(self):
+        if self.sources is None:
+            self.sources = []
 
 
 # ADD MISSING SERVICE MANAGER CLASS
@@ -102,10 +129,236 @@ class ServiceManager:
             logging.error(f"Failed to initialize Azure services: {str(e)}")
             raise
 
+class ConversationManager:
+    """Manages conversation storage and retrieval using Azure Blob Storage"""
+    
+    def __init__(self, blob_client: BlobServiceClient):
+        self.blob_client = blob_client
+        self.conversations_container = "chat-sessions"
+        self.messages_container = "chat-messages"
+    
+    async def create_conversation(self, user_id: str, title: str) -> Conversation:
+        """Create a new conversation"""
+        conversation_id = str(uuid.uuid4())
+        timestamp = datetime.now().isoformat()
+        
+        conversation = Conversation(
+            id=conversation_id,
+            user_id=user_id,
+            title=title,
+            timestamp=timestamp,
+            last_updated=timestamp,
+            message_count=0
+        )
+        
+        await self._store_conversation(conversation)
+        return conversation
+    
+async def get_conversations(self, user_id: str) -> List[Conversation]:
+    """Get all conversations for a user"""
+    conversations = []
+    
+    try:
+        container_client = self.blob_client.get_container_client(self.conversations_container)
+        
+        # Fix: Use sync iteration, not async
+        for blob in container_client.list_blobs():
+            if blob.name.startswith(f"user_{user_id}_"):
+                blob_client = self.blob_client.get_blob_client(
+                    container=self.conversations_container,
+                    blob=blob.name
+                )
+                
+                # Fix: Remove await here
+                download_stream = blob_client.download_blob()
+                conversation_data = json.loads(download_stream.readall())
+                
+                conversation = Conversation(**conversation_data)
+                conversations.append(conversation)
+        
+        # Sort by last_updated (most recent first)
+        conversations.sort(key=lambda c: c.last_updated, reverse=True)
+        
+    except Exception as e:
+        logging.error(f"Failed to get conversations for user {user_id}: {str(e)}")
+    
+    return conversations
+    
+    async def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        """Get a specific conversation"""
+        try:
+            blob_name = f"conversation_{conversation_id}.json"
+            blob_client = self.blob_client.get_blob_client(
+                container=self.conversations_container,
+                blob=blob_name
+            )
+            
+            download_stream = await blob_client.download_blob()
+            conversation_data = json.loads(await download_stream.readall())
+            
+            return Conversation(**conversation_data)
+            
+        except Exception as e:
+            logging.warning(f"Conversation {conversation_id} not found: {str(e)}")
+            return None
+    
+    async def update_conversation(self, conversation_id: str, title: str = None) -> bool:
+        """Update conversation metadata"""
+        try:
+            conversation = await self.get_conversation(conversation_id)
+            if not conversation:
+                return False
+            
+            if title:
+                conversation.title = title
+            conversation.last_updated = datetime.now().isoformat()
+            
+            await self._store_conversation(conversation)
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to update conversation {conversation_id}: {str(e)}")
+            return False
+    
+    async def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete a conversation and all its messages"""
+        try:
+            # Delete conversation metadata
+            blob_name = f"conversation_{conversation_id}.json"
+            blob_client = self.blob_client.get_blob_client(
+                container=self.conversations_container,
+                blob=blob_name
+            )
+            await blob_client.delete_blob()
+            
+            # Delete all messages for this conversation
+            container_client = self.blob_client.get_container_client(self.messages_container)
+            async for blob in container_client.list_blobs():
+                if blob.name.startswith(f"conv_{conversation_id}_"):
+                    message_blob = self.blob_client.get_blob_client(
+                        container=self.messages_container,
+                        blob=blob.name
+                    )
+                    await message_blob.delete_blob()
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to delete conversation {conversation_id}: {str(e)}")
+            return False
+    
+    async def add_message(self, conversation_id: str, sender: str, message_text: str, sources: List[Dict] = None) -> Message:
+        """Add a message to a conversation"""
+        message_id = str(uuid.uuid4())
+        timestamp = datetime.now().isoformat()
+        
+        message = Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            sender=sender,
+            message=message_text,
+            timestamp=timestamp,
+            sources=sources or []
+        )
+        
+        # Store message
+        await self._store_message(message)
+        
+        # Update conversation last_updated timestamp and message count
+        conversation = await self.get_conversation(conversation_id)
+        if conversation:
+            conversation.last_updated = timestamp
+            conversation.message_count += 1
+            await self._store_conversation(conversation)
+        
+        return message
+    
+    async def get_messages(self, conversation_id: str) -> List[Message]:
+        """Get all messages for a conversation"""
+        messages = []
+        
+        try:
+            container_client = self.blob_client.get_container_client(self.messages_container)
+            
+            async for blob in container_client.list_blobs():
+                if blob.name.startswith(f"conv_{conversation_id}_"):
+                    blob_client = self.blob_client.get_blob_client(
+                        container=self.messages_container,
+                        blob=blob.name
+                    )
+                    
+                    download_stream = await blob_client.download_blob()
+                    message_data = json.loads(await download_stream.readall())
+                    
+                    message = Message(**message_data)
+                    messages.append(message)
+            
+            # Sort by timestamp (oldest first)
+            messages.sort(key=lambda m: m.timestamp)
+            
+        except Exception as e:
+            logging.error(f"Failed to get messages for conversation {conversation_id}: {str(e)}")
+        
+        return messages
+    
+    async def _store_conversation(self, conversation: Conversation) -> None:
+        """Store conversation metadata in blob storage"""
+        blob_name = f"user_{conversation.user_id}_conversation_{conversation.id}.json"
+        blob_client = self.blob_client.get_blob_client(
+            container=self.conversations_container,
+            blob=blob_name
+        )
+        
+        conversation_data = asdict(conversation)
+        blob_client.upload_blob(  # Remove 'await' here
+            json.dumps(conversation_data, indent=2),
+            overwrite=True,
+            content_type='application/json'
+        )
+        
+        # Also store with conversation ID for direct lookup
+        blob_name_direct = f"conversation_{conversation.id}.json"
+        blob_client_direct = self.blob_client.get_blob_client(
+            container=self.conversations_container,
+            blob=blob_name_direct
+        )
+        blob_client_direct.upload_blob(  # Remove 'await' here
+            json.dumps(conversation_data, indent=2),
+            overwrite=True,
+            content_type='application/json'
+        )
+    
+    async def _store_message(self, message: Message) -> None:
+        """Store message in blob storage"""
+        blob_name = f"conv_{message.conversation_id}_msg_{message.id}.json"
+        blob_client = self.blob_client.get_blob_client(
+            container=self.messages_container,
+            blob=blob_name
+        )
+        
+        message_data = asdict(message)
+        blob_client.upload_blob(  # Remove 'await' here
+            json.dumps(message_data, indent=2),
+            overwrite=True,
+            content_type='application/json'
+        )
+
 # CREATE GLOBAL SERVICE MANAGER INSTANCE
 service_manager = ServiceManager()
+conversation_manager = None
 
-# Replace your current ConversationService class with this corrected version:
+
+
+async def get_conversation_manager() -> ConversationManager:
+    """Get or create conversation manager"""
+    global conversation_manager
+    if conversation_manager is None:
+        await service_manager.initialize()
+        conversation_manager = ConversationManager(service_manager.blob_client)
+    return conversation_manager
+
+# Replace your c
+# urrent ConversationService class with this corrected version:
 class ConversationService:
     """Conversation management using Azure Cosmos DB"""
     
@@ -122,12 +375,12 @@ class ConversationService:
             return
         
         try:
-            # For now, use in-memory storage (we'll add Cosmos DB later)
-            self.conversations_container = InMemoryContainer("conversations")
-            self.messages_container = InMemoryContainer("messages")
+            self.cosmos_client = CosmosClient.from_connection_string(os.environ.get("COSMOS_CONNECTION_STRING"))
+            self.database = self.cosmos_client.get_database_client("grc_database")
+            self.conversations_container = self.database.get_container_client("conversations")
+            self.messages_container = self.database.get_container_client("messages")
             self._initialized = True
-            logging.info("Conversation service initialized with in-memory storage")
-            
+            logging.info("Conversation service initialized with Cosmos DB")
         except Exception as e:
             logging.error(f"Failed to initialize conversation service: {str(e)}")
             raise
@@ -224,15 +477,15 @@ class MessageModel:
             timestamp=data["timestamp"]
         )
 
+
 # Azure Function: Create Conversation
 @app.function_name("CreateConversation")
 @app.route(route="conversations", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
-def create_conversation(req: func.HttpRequest) -> func.HttpResponse:
-    """Create a new conversation - matches your React frontend API"""
+async def create_conversation(req: func.HttpRequest) -> func.HttpResponse:
+    """Create a new conversation using blob storage"""
     logging.info("Creating new conversation")
     
     try:
-        
         # Parse request body
         req_body = req.get_json()
         if not req_body:
@@ -244,7 +497,6 @@ def create_conversation(req: func.HttpRequest) -> func.HttpResponse:
         
         user_id = req_body.get('user_id')
         title = req_body.get('title', 'New Conversation')
-        timestamp = req_body.get('timestamp', datetime.now(timezone.utc).isoformat())
         
         if not user_id:
             return func.HttpResponse(
@@ -253,20 +505,12 @@ def create_conversation(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
         
-        # Create conversation
-        conversation_id = str(uuid.uuid4())
-        conversation = ConversationModel(
-            id=conversation_id,
-            user_id=user_id,
-            title=title,
-            timestamp=timestamp
-        )
-        
-        # Save to Cosmos DB
-        conversation_service.conversations_container.create_item(conversation.to_dict())
+        # Use blob storage conversation manager
+        conv_manager = await get_conversation_manager()
+        conversation = await conv_manager.create_conversation(user_id, title)
         
         return func.HttpResponse(
-            json.dumps(conversation.to_dict()),
+            json.dumps(asdict(conversation)),
             mimetype="application/json"
         )
         
@@ -282,13 +526,10 @@ def create_conversation(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name("GetConversations")
 @app.route(route="conversations", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 async def get_conversations(req: func.HttpRequest) -> func.HttpResponse:
-    """Get all conversations for a user - matches your React frontend API"""
+    """Get all conversations for a user - using blob storage"""
     logging.info("Getting user conversations")
     
     try:
-        await service_manager.initialize()
-        await conversation_service.initialize()
-        
         user_id = req.params.get('user_id')
         if not user_id:
             return func.HttpResponse(
@@ -297,17 +538,14 @@ async def get_conversations(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
         
-        # Query conversations for user
-        query = "SELECT * FROM c WHERE c.user_id = @user_id ORDER BY c.timestamp DESC"
-        parameters = [{"name": "@user_id", "value": user_id}]
+        # Use blob storage conversation manager
+        conv_manager = await get_conversation_manager()
+        conversations = await conv_manager.get_conversations(user_id)
         
-        conversations = list(conversation_service.conversations_container.query_items(
-            query=query,
-            parameters=parameters
-        ))
+        conversations_data = [asdict(conv) for conv in conversations]
         
         return func.HttpResponse(
-            json.dumps(conversations),
+            json.dumps(conversations_data),
             mimetype="application/json"
         )
         
@@ -318,6 +556,32 @@ async def get_conversations(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
+@app.function_name("GetConversationMessages")
+@app.route(route="conversations/{conversation_id}/messages", methods=["GET"])
+async def get_conversation_messages(req: func.HttpRequest) -> func.HttpResponse:
+    """Get all messages for a conversation"""
+    try:
+        conversation_id = req.route_params.get('conversation_id')
+        
+        conv_manager = await get_conversation_manager()
+        messages = await conv_manager.get_messages(conversation_id)
+        
+        messages_data = [asdict(msg) for msg in messages]
+        
+        return func.HttpResponse(
+            json.dumps(messages_data),
+            mimetype="application/json"
+        )
+        
+    except Exception as e:
+        logging.error(f"Get messages failed: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
 
 # Azure Function: Add Message and Get AI Response
 @app.function_name("AddMessage")
