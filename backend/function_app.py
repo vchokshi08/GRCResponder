@@ -1520,62 +1520,72 @@ async def get_vector_queue() -> List[Dict]:
 
 # Part 1: Scheduled Proceeding Scraper (runs 3x per week)
 @app.function_name("ScheduledProceedingScraper")
-@app.schedule(schedule="0 0 6 * * 2,4,6", arg_name="timer", run_on_startup=False)
+@app.schedule(schedule="0 15 */6 * * *", arg_name="timer", run_on_startup=False)
 def scheduled_proceeding_scraper(timer: func.TimerRequest) -> None:
     """
-    FIXED: Timer function for proceeding scraping
-    - Synchronous function signature (no async)
-    - Uses asyncio.run() to handle async operations internally
+    FULL IMPLEMENTATION: Proceeding scraper with complete battle-tested logic
     """
-    logging.info("Starting Scheduled CPUC Proceeding Scraper - Step 1/3")
+    logging.info("Starting Scheduled CPUC Proceeding Scraper with Full Logic - Step 1/3")
     
-    def run_scraper():
-        """Inner async function to handle the actual scraping"""
+    def run_async_scraper():
+        """Execute full async scraping logic"""
         try:
-            # Simple test first - create a test file to verify timer execution
-            blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
-            container_name = "proceedings-metadata"
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            blob_name = f"scraper_run_{timestamp}.json"
+            # Create new event loop for timer execution
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             
-            test_data = {
-                "status": "timer_function_executed",
-                "timestamp": datetime.now().isoformat(),
-                "message": "Proceeding scraper timer function working",
-                "function_name": "ScheduledProceedingScraper",
-                "next_step": "Add full scraping logic"
-            }
-            
-            blob_client_instance = blob_client.get_blob_client(
-                container=container_name,
-                blob=blob_name
-            )
-            
-            blob_client_instance.upload_blob(
-                json.dumps(test_data, indent=2),
-                overwrite=True
-            )
-            
-            logging.info(f"Timer function test successful - created {blob_name}")
-            
-            # TODO: Add full async scraping logic here
-            # return asyncio.run(scrape_all_cpuc_proceedings())
-            
+            try:
+                return loop.run_until_complete(full_proceeding_scraper())
+            finally:
+                loop.close()
+                
         except Exception as e:
-            logging.error(f"Scheduled proceeding scraper failed: {str(e)}")
+            logging.error(f"Async scraper execution failed: {str(e)}")
             raise
     
-    # Execute the scraper logic
+    # Execute the full scraper logic
     try:
-        run_scraper()
+        run_async_scraper()
     except Exception as e:
-        logging.error(f"Timer function execution failed: {str(e)}")
-    
-    # Execute the scraper logic
+        logging.error(f"Scheduled proceeding scraper failed: {str(e)}")
+
+async def full_proceeding_scraper():
+    """Complete async proceeding scraper implementation"""
     try:
-        run_scraper()
+        # Initialize service manager
+        await service_manager.initialize()
+        
+        # Get existing proceedings for incremental updates
+        existing_proceedings = await get_existing_proceedings()
+        logging.info(f"Loaded {len(existing_proceedings)} existing proceedings for deduplication")
+        
+        # Scrape all proceedings using battle-tested logic
+        all_proceedings = await scrape_all_cpuc_proceedings()  # This calls your existing function!
+        logging.info(f"Scraped {len(all_proceedings)} total proceedings")
+        
+        # Filter and deduplicate (only process new/changed proceedings)
+        filtered_proceedings = await filter_and_deduplicate_proceedings(
+            all_proceedings, existing_proceedings
+        )
+        logging.info(f"Found {len(filtered_proceedings)} new/changed proceedings for processing")
+        
+        if filtered_proceedings:
+            # Store proceedings metadata
+            await store_proceedings_metadata(filtered_proceedings)
+            
+            # Create download queue for Document Downloader (Step 2)
+            await create_download_queue(filtered_proceedings)
+            
+            # Update tracking for incremental processing
+            await update_proceedings_tracking(filtered_proceedings)
+            
+            logging.info(f"✅ Proceeding scraper completed successfully: {len(filtered_proceedings)} proceedings queued for download")
+        else:
+            logging.info("No new proceedings found - system is up to date")
+        
     except Exception as e:
-        logging.error(f"Timer function execution failed: {str(e)}")
+        logging.error(f"Full proceeding scraper failed: {str(e)}")
+        raise
 
 async def scrape_all_cpuc_proceedings() -> List[Dict]:
     """Comprehensive CPUC proceeding scraper - based on original threaded_webscraper.py"""
@@ -1706,55 +1716,104 @@ async def parse_single_proceeding(session: aiohttp.ClientSession, proceeding_id:
 
 # Part 2: Document Downloader (runs every 6 hours)
 @app.function_name("ScheduledDocumentDownloader")
-@app.schedule(schedule="0 15 */6 * * *", arg_name="timer", run_on_startup=False)
+@app.schedule(schedule="0 35 20 * * *", arg_name="timer", run_on_startup=False)
 def scheduled_document_downloader(timer: func.TimerRequest) -> None:
     """
-    FIXED: Timer function for document downloading
-    - Synchronous function signature (no async)
-    - Uses asyncio.run() to handle async operations internally
+    FULL IMPLEMENTATION: Document downloader with complete battle-tested logic
     """
-    logging.info("Starting Scheduled Document Downloader - Step 2/3")
+    logging.info("Starting Scheduled Document Downloader with Full Logic - Step 2/3")
     
-    def run_downloader():
-        """Inner function to handle document downloading"""
+    def run_async_downloader():
+        """Execute full async download logic"""
         try:
-            # Test functionality first
+            # Create new event loop for timer execution
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                return loop.run_until_complete(full_document_downloader())
+            finally:
+                loop.close()
+                
+        except Exception as e:
+            logging.error(f"Async downloader execution failed: {str(e)}")
+            raise
+    
+    # Execute the full downloader logic
+    try:
+        run_async_downloader()
+    except Exception as e:
+        logging.error(f"Scheduled document downloader failed: {str(e)}")
+
+async def full_document_downloader():
+    """Complete async document downloader implementation"""
+    try:
+        await service_manager.initialize()
+        
+        # Get queued proceedings from Step 1 (Proceeding Scraper)
+        queue_items = await get_download_queue()
+        
+        if not queue_items:
+            logging.info("No items in download queue - creating status file")
+            
+            # Create status file to show downloader ran
             blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
             container_name = "documents-raw"
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            blob_name = f"downloader_run_{timestamp}.json"
+            blob_name = f"downloader_no_queue_{timestamp}.json"
             
-            test_data = {
-                "status": "timer_function_executed",
+            status_data = {
+                "status": "no_queue_items",
                 "timestamp": datetime.now().isoformat(),
-                "message": "Document downloader timer function working",
-                "function_name": "ScheduledDocumentDownloader",
-                "next_step": "Add full download logic"
+                "message": "No proceedings queued for download"
             }
             
-            blob_client_instance = blob_client.get_blob_client(
-                container=container_name,
-                blob=blob_name
-            )
+            blob_client_instance = blob_client.get_blob_client(container_name, blob_name)
+            blob_client_instance.upload_blob(json.dumps(status_data, indent=2), overwrite=True)
+            return
+        
+        logging.info(f"Processing {len(queue_items)} proceedings for document download")
+        
+        # Get existing document hashes for deduplication
+        existing_documents = await get_existing_document_hashes()
+        
+        # Process downloads with enhanced deduplication using your existing functions
+        processed_documents = await process_download_queue_with_deduplication(
+            queue_items, existing_documents
+        )
+        
+        if processed_documents:
+            # Create vector processing queue for Step 3 (Vector Builder)
+            await create_vector_queue(processed_documents)
             
-            blob_client_instance.upload_blob(
-                json.dumps(test_data, indent=2),
-                overwrite=True
-            )
+            # Update document tracking for deduplication
+            await update_document_tracking(processed_documents)
             
-            logging.info(f"Document downloader test successful - created {blob_name}")
-            
-            # TODO: Add full async download logic here
-            # return asyncio.run(process_download_queue())
-            
-        except Exception as e:
-            logging.error(f"Scheduled document downloader failed: {str(e)}")
-            raise
-    
-    try:
-        run_downloader()
+            logging.info(f"✅ Document downloader completed successfully: {len(processed_documents)} documents processed and queued for vectorization")
+        else:
+            logging.info("No new documents were downloaded (all were duplicates or failed)")
+        
+        # Create summary status file
+        blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+        container_name = "documents-raw"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        blob_name = f"downloader_summary_{timestamp}.json"
+        
+        summary_data = {
+            "status": "completed",
+            "timestamp": datetime.now().isoformat(),
+            "proceedings_processed": len(queue_items),
+            "documents_downloaded": len(processed_documents),
+            "message": f"Successfully processed {len(processed_documents)} new documents"
+        }
+        
+        blob_client_instance = blob_client.get_blob_client(container_name, blob_name)
+        blob_client_instance.upload_blob(json.dumps(summary_data, indent=2), overwrite=True)
+        
     except Exception as e:
-        logging.error(f"Timer function execution failed: {str(e)}")
+        logging.error(f"Full document downloader failed: {str(e)}")
+        raise
+
 
 async def get_existing_document_hashes() -> Dict[str, str]:
     """Get hashes of already processed documents for deduplication"""
@@ -2066,55 +2125,88 @@ async def update_document_tracking(documents: List[Dict]) -> None:
 
 # Part 3: Vector Database Builder (runs every 4 hours)  
 @app.function_name("ScheduledVectorBuilder")
-@app.schedule(schedule="0 0 */4 * * *", arg_name="timer", run_on_startup=False)  
+@app.schedule(schedule="0 40 20 * * *", arg_name="timer", run_on_startup=False)
 def scheduled_vector_builder(timer: func.TimerRequest) -> None:
     """
-    FIXED: Timer function for vector building
-    - Synchronous function signature (no async)
-    - Uses asyncio.run() to handle async operations internally
+    FULL IMPLEMENTATION: Vector builder with complete battle-tested logic
     """
-    logging.info("Starting Scheduled Vector Database Builder - Step 3/3")
+    logging.info("Starting Scheduled Vector Database Builder with Full Logic - Step 3/3")
     
-    def run_vector_builder():
-        """Inner function to handle vector building"""
+    def run_async_vector_builder():
+        """Execute full async vector building logic"""
         try:
-            # Test functionality first
+            # Create new event loop for timer execution
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                return loop.run_until_complete(full_vector_builder())
+            finally:
+                loop.close()
+                
+        except Exception as e:
+            logging.error(f"Async vector builder execution failed: {str(e)}")
+            raise
+    
+    # Execute the full vector builder logic
+    try:
+        run_async_vector_builder()
+    except Exception as e:
+        logging.error(f"Scheduled vector builder failed: {str(e)}")
+
+async def full_vector_builder():
+    """Complete async vector builder implementation"""
+    try:
+        await service_manager.initialize()
+        
+        # Get queued documents from Step 2 (Document Downloader)
+        queue_items = await get_vector_queue()
+        
+        if not queue_items:
+            logging.info("No items in vector processing queue - creating status file")
+            
+            # Create status file to show vector builder ran
             blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
             container_name = "vectors-index"
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            blob_name = f"vector_builder_run_{timestamp}.json"
+            blob_name = f"vector_builder_no_queue_{timestamp}.json"
             
-            test_data = {
-                "status": "timer_function_executed",
+            status_data = {
+                "status": "no_queue_items",
                 "timestamp": datetime.now().isoformat(),
-                "message": "Vector builder timer function working",
-                "function_name": "ScheduledVectorBuilder",
-                "next_step": "Add full vector processing logic"
+                "message": "No documents queued for vector processing"
             }
             
-            blob_client_instance = blob_client.get_blob_client(
-                container=container_name,
-                blob=blob_name
-            )
-            
-            blob_client_instance.upload_blob(
-                json.dumps(test_data, indent=2),
-                overwrite=True
-            )
-            
-            logging.info(f"Vector builder test successful - created {blob_name}")
-            
-            # TODO: Add full async vector processing logic here
-            # return asyncio.run(process_vector_queue())
-            
-        except Exception as e:
-            logging.error(f"Scheduled vector builder failed: {str(e)}")
-            raise
-    
-    try:
-        run_vector_builder()
+            blob_client_instance = blob_client.get_blob_client(container_name, blob_name)
+            blob_client_instance.upload_blob(json.dumps(status_data, indent=2), overwrite=True)
+            return
+        
+        logging.info(f"Processing {len(queue_items)} documents for vector indexing")
+        
+        # Process documents with multithreaded vector generation using your existing function
+        await process_vector_queue_enhanced(queue_items)
+        
+        # Create summary status file
+        blob_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+        container_name = "vectors-index"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        blob_name = f"vector_builder_summary_{timestamp}.json"
+        
+        summary_data = {
+            "status": "completed",
+            "timestamp": datetime.now().isoformat(),
+            "documents_processed": len(queue_items),
+            "message": f"Successfully vectorized {len(queue_items)} documents and indexed in Azure AI Search"
+        }
+        
+        blob_client_instance = blob_client.get_blob_client(container_name, blob_name)
+        blob_client_instance.upload_blob(json.dumps(summary_data, indent=2), overwrite=True)
+        
+        logging.info(f"✅ Vector builder completed successfully: {len(queue_items)} documents vectorized and indexed")
+        
     except Exception as e:
-        logging.error(f"Timer function execution failed: {str(e)}")
+        logging.error(f"Full vector builder failed: {str(e)}")
+        raise
 
 async def process_vector_queue_enhanced(queue_items: List[Dict]) -> None:
     """Enhanced vector processing based on original multithreaded_insert.py patterns"""
